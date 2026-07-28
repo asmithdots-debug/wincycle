@@ -1,0 +1,7 @@
+# build output
+WinCycle
+
+# private signing material — never committed, regenerate with setup-signing.sh
+signing/
+
+.DS_Store
