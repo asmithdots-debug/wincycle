@@ -390,11 +390,10 @@ final class Controller: NSObject, NSApplicationDelegate {
     // пересчитывается по новому списку.
     //
     // Порядок нужно где-то хранить между тактами опроса — иначе непонятно,
-    // какое окно «последнее» и чью ячейку делить дальше. Закрывшиеся окна
-    // просто выпадают из списка при следующем открытии нового; сам список
-    // при этом не пересчитывается заново — так что закрытие окна пока не
-    // схлопывает освободившееся место, только следующее открытие использует
-    // актуальный список.
+    // какое окно «последнее» и чью ячейку делить дальше. Закрытие окна
+    // (или его сворачивание, или Command+H — с точки зрения раскладки это
+    // всё «пропало из отслеживаемых») точно так же пересчитывает раскладку
+    // на его экране, освобождённое место сразу отдаётся соседям.
     //
     // Набор окон для тайлинга — ВСЕ подходящие окна, включая те, что сейчас
     // занимают почти весь экран. Это важно: если исключать такие окна отсюда
@@ -432,12 +431,25 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         let newIDs = currentIDs.subtracting(knownWindowIDs)
-        guard !newIDs.isEmpty else { return }
+        let closedIDs = knownWindowIDs.subtracting(currentIDs)
+        guard !newIDs.isEmpty || !closedIDs.isEmpty else { return }
         let newOnes = current.filter { newIDs.contains($0.windowID) }
 
-        // Пересчитываем раскладку только на экранах, где реально что-то
-        // появилось — остальные не трогаем, даже если там тоже есть окна.
-        let screens = Set(newOnes.compactMap { screenContaining($0.center) })
+        // Экраны для пересчёта: те, где появилось новое окно, — они уже
+        // известны по координатам самого окна. А вот при закрытии узнать
+        // экран так не выйдет: окно уже пропало, спросить не у кого.
+        // Поэтому если что-то закрылось, на всякий случай пересчитываем
+        // все экраны, за которыми раскладка вообще следит, — лишний
+        // холостой пересчёт дешевле, чем пропущенное схлопывание пустоты.
+        var screens = Set(newOnes.compactMap { screenContaining($0.center) })
+        if !closedIDs.isEmpty {
+            for did in tileOrder.keys {
+                if let screen = NSScreen.screens.first(where: { screenID($0) == did }) {
+                    screens.insert(screen)
+                }
+            }
+        }
+
         for screen in screens {
             guard let id = screenID(screen) else { continue }
             let onScreen = current.filter { screenContaining($0.center) === screen }
