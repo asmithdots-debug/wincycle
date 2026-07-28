@@ -25,6 +25,9 @@
 // умолчанию. Первое окно на весь экран, каждое следующее делит пополам
 // ячейку последнего добавленного, направление деления — по пропорциям этой
 // ячейки. Получается спираль: одно большое окно и всё мельче остальные.
+// Ячеек не больше пяти: шестое и последующие окна складываются стопкой
+// в последнюю ячейку, сверху — самое новое, до остальных можно добраться
+// перебором Option+Tab.
 // Между окнами и по краю экрана — зазор 8pt, такой же, как у Raycast Window
 // Management. Раскладку не получают окна в настоящем системном
 // полноэкранном режиме (тот же признак и в переборе) и окна, которым нельзя
@@ -80,6 +83,15 @@ private let dimSteps = [15, 25, 35, 45, 55, 70]
 // Window Management при Control+стрелка вверх (измерено вживую: маленькая
 // область показывает выигрыш в отступе именно 8pt со всех сторон).
 private let tileGap: CGFloat = 8
+
+// Сколько ячеек раскладка делает максимум. Дальше делить бессмысленно:
+// на экране ноутбука шестая ячейка уже уже трёхсот точек, читать в ней
+// нечего. Всё, что сверх, уходит стопкой в последнюю ячейку.
+private let maxTiles = 5
+
+// Сколько ждать, пока программа применит поставленную ей рамку, прежде чем
+// считать расхождение ручным вмешательством.
+private let settleTime: TimeInterval = 1.0
 
 // Приложения, чьи окна не попадают ни в перебор, ни в раскладку, даже когда
 // формально проходят все обычные проверки (обычное окно, видимое, полная
@@ -156,6 +168,10 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// нужна, чтобы отличить «это раскладка его так растянула» от «кто-то
     /// подвинул или растянул окно сам, пока мы не смотрели».
     private var lastAppliedFrame: [CGWindowID: CGRect] = [:]
+    /// Когда раскладка последний раз ставила окну рамку. Пока с этого момента
+    /// не прошло settleTime, расхождение считается неуспевшим применением,
+    /// а не ручным вмешательством — см. watchManualResize.
+    private var appliedAt: [CGWindowID: Date] = [:]
     /// Окна, которые вручную растянули почти на весь экран (например, через
     /// Raycast) — временно выведены из раскладки, отдельно на каждый экран.
     /// Возвращаются обратно, как только перестают быть почти во весь экран.
@@ -617,6 +633,16 @@ final class Controller: NSObject, NSApplicationDelegate {
                     !close(win.frame, expected)
                 else { continue }
 
+                // Просьба переставить окно выполняется не мгновенно: пока
+                // программа её применяет (а многие ещё и анимируют), окно
+                // отвечает старой рамкой. Если верить этому сразу, только
+                // что размещённое окно тут же считается переставленным
+                // вручную — по его СТАРОМУ месту, где оно открылось. На
+                // каждое новое окно раскладка делала два пересчёта подряд,
+                // второй из них по случайному поводу, и окно уезжало не
+                // туда, куда его положила раскладка.
+                if let at = appliedAt[id], Date().timeIntervalSince(at) < settleTime { continue }
+
                 if isNearFullScreenArea(win.frame, on: screen) {
                     order.removeAll { $0 == id }
                     floatSet.insert(id)
@@ -782,11 +808,20 @@ final class Controller: NSObject, NSApplicationDelegate {
         log("по центру поверх остальных (размер фиксированный): \(win.owner)")
     }
 
+    // Ячеек в раскладке не больше maxTiles: дальше делить нечего, окна
+    // становятся нечитаемыми. Всё, что сверх, складывается стопкой в
+    // последнюю (самую маленькую) ячейку — видно верхнее окно стопки,
+    // остальные под ним. Ничего не пропадает: перебор Option+Tab и так
+    // ходит по всем окнам, а не только по видимым, так что до спрятанного
+    // окна можно добраться без нового сочетания клавиш. Поднятое окно
+    // перекроет соседей по стопке само, по обычным правилам системы.
     private func tileWindows(_ windows: [WinRef], on screen: NSScreen) {
         let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
-        let rects = dwindleRects(count: windows.count, in: area)
+        let rects = dwindleRects(count: min(windows.count, maxTiles), in: area)
+        guard !rects.isEmpty else { return }
 
-        for (win, rect) in zip(windows, rects) {
+        for (i, win) in windows.enumerated() {
+            let rect = rects[min(i, rects.count - 1)]
             var pos = rect.origin
             var size = rect.size
             let posVal = AXValueCreate(.cgPoint, &pos)!
@@ -794,9 +829,18 @@ final class Controller: NSObject, NSApplicationDelegate {
             AXUIElementSetAttributeValue(win.element, kAXPositionAttribute as CFString, posVal)
             AXUIElementSetAttributeValue(win.element, kAXSizeAttribute as CFString, sizeVal)
             lastAppliedFrame[win.windowID] = rect
+            appliedAt[win.windowID] = Date()
+        }
+
+        // Сверху стопки — самое новое окно: его только что открыли, значит
+        // с ним и собираются работать.
+        let stacked = windows.count - maxTiles + 1
+        if stacked > 1, let top = windows.last {
+            AXUIElementPerformAction(top.element, kAXRaiseAction as CFString)
         }
         log(
-            "dwindle: \(windows.count) окон — "
+            "dwindle: \(windows.count) окон"
+                + (stacked > 1 ? " (в стопке: \(stacked))" : "") + " — "
                 + windows.map(\.owner).joined(separator: ", "))
     }
 
