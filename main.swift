@@ -46,6 +46,10 @@ struct WinRef {
     /// Положение в системном списке окон: 0 — самое переднее.
     let depth: Int
     let windowID: CGWindowID
+    /// Окно занимает почти весь экран прямо сейчас. Не значит «намеренно
+    /// максимизировано пользователем» — так же выглядит и окно, которое
+    /// сама раскладка растянула, будучи единственным на экране.
+    let isFullScreenNow: Bool
     /// Только для журнала.
     let owner: String
 }
@@ -235,6 +239,14 @@ final class Controller: NSObject, NSApplicationDelegate {
             hideOverlays()
             return
         }
+        // Затемнять относительно чего? Если реальное окно на экране всего
+        // одно — не важно, само ли оно так открылось, растянула ли его наша
+        // раскладка или пользователь развернул вручную, — сравнивать не с
+        // чем, и подложка только мешала бы тёмной полосой по краям.
+        guard collectWindows().count > 1 else {
+            hideOverlays()
+            return
+        }
         let alpha = CGFloat(dimLevel) / 100
         for overlay in overlays { overlay.apply(alpha: alpha) }
 
@@ -384,15 +396,28 @@ final class Controller: NSObject, NSApplicationDelegate {
     // схлопывает освободившееся место, только следующее открытие использует
     // актуальный список.
     //
-    // Набор окон для тайлинга — тот же orderedWindows(), что и для перебора,
-    // то есть окно, растянутое почти на весь экран (например, вручную через
-    // Raycast), в раскладку не попадёт и останется как есть: раз его размер
-    // выбрали намеренно, тайлингу трогать его незачем.
+    // Набор окон для тайлинга — ВСЕ подходящие окна, включая те, что сейчас
+    // занимают почти весь экран. Это важно: если исключать такие окна отсюда
+    // так же, как исключаем их из перебора, раскладка ломала бы сама себя —
+    // единственное окно на экране dwindle сам растягивает на весь экран (это
+    // и есть правильное поведение при n=1), а на следующем такте это же
+    // окно перестало бы считаться «подходящим» и выпало бы из отслеживания.
+    // Дальше уже ничего не с чем сравнивать: следующее открытое окно видит
+    // пустой список, тайлинг не срабатывает вообще — ровно то, что и
+    // случалось до этого исправления.
+    //
+    // Разница между «сама раскладка растянула» и «пользователь растянул
+    // нарочно» проводится не по текущему размеру окна, а по тому, отслеживаем
+    // ли мы уже это окно: если оно уже есть в списке порядка — значит, когда-
+    // то раскладка сама его туда добавила, и то, что оно сейчас большое, не
+    // повод его забывать. А вот когда окно видим впервые и оно уже почти во
+    // весь экран — это, скорее всего, чужих рук дело (Raycast, mpv,
+    // Ghostty с fullscreen=yes), такое в раскладку не берём.
 
     private func checkForNewWindows() {
         guard tilingEnabled, !cycling else { return }
 
-        let current = orderedWindows()
+        let current = collectWindows()
         let currentIDs = Set(current.map(\.windowID))
         defer { knownWindowIDs = currentIDs }
 
@@ -406,21 +431,7 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         let newIDs = currentIDs.subtracting(knownWindowIDs)
         guard !newIDs.isEmpty else { return }
-        // Новых окон в одном такте почти всегда одно, но на случай, если
-        // открылось сразу несколько, добавляем все — по возрастанию номера
-        // окна, чтобы порядок был стабильным, а не зависел от CGWindowList.
-        let newOnes = current.filter { newIDs.contains($0.windowID) }.sorted {
-            $0.windowID < $1.windowID
-        }
-
-        for newWindow in newOnes {
-            guard let screen = screenContaining(newWindow.center),
-                let id = screenID(screen)
-            else { continue }
-            var order = tileOrder[id] ?? []
-            if !order.contains(newWindow.windowID) { order.append(newWindow.windowID) }
-            tileOrder[id] = order
-        }
+        let newOnes = current.filter { newIDs.contains($0.windowID) }
 
         // Пересчитываем раскладку только на экранах, где реально что-то
         // появилось — остальные не трогаем, даже если там тоже есть окна.
@@ -430,19 +441,15 @@ final class Controller: NSObject, NSApplicationDelegate {
             let onScreen = current.filter { screenContaining($0.center) === screen }
             let byID = Dictionary(uniqueKeysWithValues: onScreen.map { ($0.windowID, $0) })
 
-            // Список порядка мог накопить окна, которых уже нет на экране
-            // (закрылись, свернулись, стали занимать весь экран) — чистим
-            // его перед раскладкой и заодно приписываем в конец те, что
-            // почему-то оказались на экране, минуя наше отслеживание
-            // (например, существовали ещё до запуска WinCycle).
             var order = (tileOrder[id] ?? []).filter { byID[$0] != nil }
             for win in onScreen where !order.contains(win.windowID) {
+                if win.isFullScreenNow { continue }
                 order.append(win.windowID)
             }
             tileOrder[id] = order
 
             let ordered = order.compactMap { byID[$0] }
-            guard ordered.count > 1 else { continue }
+            guard !ordered.isEmpty else { continue }
             tileWindows(ordered, on: screen)
         }
     }
@@ -528,10 +535,13 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     // MARK: список окон
 
-    // Порядок спереди назад даёт CGWindowList, а управлять окнами умеет только
-    // Accessibility — поэтому одно сопоставляется с другим по владельцу и рамке.
-    // Затем список пересортировывается по кругу.
-    private func orderedWindows() -> [WinRef] {
+    // Собирает все подходящие окна, включая те, что сейчас занимают почти
+    // весь экран — этот фильтр применяется отдельно, только там, где он
+    // действительно нужен (см. orderedWindows() и комментарий у тайлинга
+    // выше). Порядок — спереди назад, как отдаёт CGWindowList; управлять
+    // окнами умеет только Accessibility, поэтому одно сопоставляется
+    // с другим по владельцу и рамке.
+    private func collectWindows() -> [WinRef] {
         guard
             let list = CGWindowListCopyWindowInfo(
                 [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
@@ -575,7 +585,6 @@ final class Controller: NSObject, NSApplicationDelegate {
             if isMinimized(match) { continue }
             // панели, всплывашки и диалоги тоже мимо: берём только обычные окна
             if !isStandardWindow(match) { continue }
-            if isFullScreen(match, frame: frame) { continue }
 
             guard let windowID = info[kCGWindowNumber as String] as? CGWindowID else { continue }
 
@@ -583,11 +592,19 @@ final class Controller: NSObject, NSApplicationDelegate {
                 WinRef(
                     pid: pid, element: match,
                     center: CGPoint(x: frame.midX, y: frame.midY), depth: depth,
-                    windowID: windowID, owner: owner.localizedName ?? "?"))
+                    windowID: windowID, isFullScreenNow: isFullScreen(match, frame: frame),
+                    owner: owner.localizedName ?? "?"))
             depth += 1
         }
 
-        return sortedClockwise(found)
+        return found
+    }
+
+    // Список для перебора (Option+Tab): здесь фильтр «почти весь экран»
+    // нужен всегда — Option+Tab не должен уводить фокус на окно, которое
+    // пользователь развернул нарочно.
+    private func orderedWindows() -> [WinRef] {
+        sortedClockwise(collectWindows().filter { !$0.isFullScreenNow })
     }
 
     // Сортировка по кругу: считаем общий центр всех окон и раскладываем их
