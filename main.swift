@@ -26,8 +26,11 @@
 // ячейку последнего добавленного, направление деления — по пропорциям этой
 // ячейки. Получается спираль: одно большое окно и всё мельче остальные.
 // Между окнами и по краю экрана — зазор 8pt, такой же, как у Raycast Window
-// Management. Раскладку не получают только окна в настоящем системном
-// полноэкранном режиме — тот же признак и в переборе.
+// Management. Раскладку не получают окна в настоящем системном
+// полноэкранном режиме (тот же признак и в переборе) и окна, которым нельзя
+// менять размер, — настройки системы, окна настроек программ по Command+,
+// и подобные диалоги: их вместо этого ставит по центру экрана поверх
+// остальных.
 //
 // Ручное вмешательство в отслеживаемое окно раскладка тоже подхватывает.
 // Растянули почти на весь экран (Raycast, перетаскиванием и так далее) —
@@ -57,6 +60,10 @@ struct WinRef {
     let windowID: CGWindowID
     /// Настоящий системный полноэкранный режим (AXFullScreen).
     let isFullScreenNow: Bool
+    /// Окну вообще можно менять размер. Настройки системы, окна настроек
+    /// программ по Command+, и подобные диалоги размер менять не дают —
+    /// раскладке их трогать нельзя.
+    let isResizable: Bool
     /// Только для журнала.
     let owner: String
 }
@@ -153,6 +160,12 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// Raycast) — временно выведены из раскладки, отдельно на каждый экран.
     /// Возвращаются обратно, как только перестают быть почти во весь экран.
     private var floated: [CGDirectDisplayID: Set<CGWindowID>] = [:]
+    /// Окна с фиксированным размером, которые раскладка уже поставила по
+    /// центру. Повторно не трогаем: пользователь мог отодвинуть окно сам.
+    private var centered: Set<CGWindowID> = []
+    /// Окна, пропавшие из снимка ровно на прошлом такте. Закрытыми считаем
+    /// только те, что не вернулись и на следующем — см. checkForNewWindows.
+    private var missingOnce: Set<CGWindowID> = []
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -204,6 +217,16 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         let timer = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
             guard let self else { return }
+            // Страховка: признак «идёт перебор» гасится по событию отпускания
+            // Option, а событие можно и не получить — например, если Option
+            // отпустили в момент, когда система не доставила нам flagsChanged.
+            // Тогда признак остался бы взведённым навсегда, а вместе с ним
+            // намертво замерла бы вся раскладка: и появление новых окон,
+            // и слежение за ручными перестановками пропускают такт, пока
+            // идёт перебор. Поэтому сверяемся с фактическим состоянием
+            // клавиш — во время настоящего перебора Option зажат, и признак
+            // остаётся на месте.
+            if self.cycling, !NSEvent.modifierFlags.contains(.option) { self.cycling = false }
             self.updateDimming(force: false)
             // Один и тот же снимок окон на этот такт используют обе задачи —
             // не запрашивать Accessibility дважды подряд за одно и то же.
@@ -444,7 +467,20 @@ final class Controller: NSObject, NSApplicationDelegate {
         guard tilingEnabled, !cycling else { return }
 
         let currentIDs = Set(current.map(\.windowID))
-        defer { knownWindowIDs = currentIDs }
+
+        // Окно, пропавшее ровно на один такт, закрытым не считаем. Пока
+        // Raycast переставляет окно, системный список и Accessibility на
+        // мгновение расходятся: один уже показывает новое место, другой ещё
+        // старое, сопоставить их не удаётся и окно исчезает из снимка. Если
+        // верить этому сразу, раскладка на треть секунды схлопывается по
+        // числу оставшихся окон и тут же разворачивается обратно — видно как
+        // рывок соседних окон туда-обратно. Ждём подтверждения на следующем
+        // такте: настоящее закрытие никуда не денется, а мигание пройдёт.
+        let vanished = knownWindowIDs.subtracting(currentIDs)
+        let closedIDs = vanished.intersection(missingOnce)
+        let stillPending = vanished.subtracting(closedIDs)
+        missingOnce = stillPending
+        defer { knownWindowIDs = currentIDs.union(stillPending) }
 
         // Первый такт после запуска — не «все окна только что открылись»,
         // а просто исходное состояние экрана. Раскладывать заново то, что
@@ -455,9 +491,16 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         let newIDs = currentIDs.subtracting(knownWindowIDs)
-        let closedIDs = knownWindowIDs.subtracting(currentIDs)
+        centered.formIntersection(currentIDs)
         guard !newIDs.isEmpty || !closedIDs.isEmpty else { return }
         let newOnes = current.filter { newIDs.contains($0.windowID) }
+
+        // Окна с фиксированным размером в раскладку не берём — их всё равно
+        // не растянуть под ячейку. Вместо этого ставим по центру экрана
+        // поверх остальных: так их видно целиком и не приходится искать.
+        for win in newOnes where !win.isResizable {
+            centerOnTop(win)
+        }
 
         // Экраны для пересчёта: те, где появилось новое окно, — они уже
         // известны по координатам самого окна. А вот при закрытии узнать
@@ -467,6 +510,18 @@ final class Controller: NSObject, NSApplicationDelegate {
         // холостой пересчёт дешевле, чем пропущенное схлопывание пустоты.
         var screens = Set(newOnes.compactMap { screenContaining($0.center) })
         if !closedIDs.isEmpty {
+            // Экран закрывшегося окна спросить уже не у кого — окна нет.
+            // Берём все экраны, где сейчас есть окна, плюс те, за которыми
+            // раскладка уже следит (последний нужен, чтобы опустевший экран
+            // не остался с записью о несуществующих окнах). Раньше здесь были
+            // только экраны из tileOrder — и если раскладка ещё пуста (сразу
+            // после запуска WinCycle, когда окна на экране уже стояли), то
+            // закрытие окна не приводило вообще ни к чему: пересчитывать
+            // было нечего, а подхватить уже открытые окна этот путь не мог.
+            // Раскладка оживала только при открытии следующего нового окна.
+            for win in current {
+                if let screen = screenContaining(win.center) { screens.insert(screen) }
+            }
             for did in tileOrder.keys {
                 if let screen = NSScreen.screens.first(where: { screenID($0) == did }) {
                     screens.insert(screen)
@@ -483,6 +538,7 @@ final class Controller: NSObject, NSApplicationDelegate {
             var order = (tileOrder[id] ?? []).filter { byID[$0] != nil }
             for win in onScreen where !order.contains(win.windowID) {
                 if win.isFullScreenNow || floatedHere.contains(win.windowID) { continue }
+                if !win.isResizable { continue }
                 order.append(win.windowID)
             }
             tileOrder[id] = order
@@ -687,6 +743,25 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     // windows должен быть в порядке добавления: windows[0] — самое старое
     // окно на этом экране, оно получает первый (самый большой) кусок.
+    // Окно с фиксированным размером ставим по центру его экрана и поднимаем
+    // над остальными. Размер не трогаем вовсе — его и нельзя менять, ради
+    // этого окно и выведено из раскладки.
+    private func centerOnTop(_ win: WinRef) {
+        guard !centered.contains(win.windowID),
+            let screen = screenContaining(win.center)
+        else { return }
+        centered.insert(win.windowID)
+
+        let area = axRect(for: screen.visibleFrame)
+        var pos = CGPoint(
+            x: area.midX - win.frame.width / 2,
+            y: area.midY - win.frame.height / 2)
+        let posVal = AXValueCreate(.cgPoint, &pos)!
+        AXUIElementSetAttributeValue(win.element, kAXPositionAttribute as CFString, posVal)
+        AXUIElementPerformAction(win.element, kAXRaiseAction as CFString)
+        log("по центру поверх остальных (размер фиксированный): \(win.owner)")
+    }
+
     private func tileWindows(_ windows: [WinRef], on screen: NSScreen) {
         let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
         let rects = dwindleRects(count: windows.count, in: area)
@@ -722,6 +797,11 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         var found: [WinRef] = []
         var cache: [pid_t: [AXUIElement]] = [:]
+        // Один элемент Accessibility — одному окну из системного списка.
+        // Без этого два окна одной программы, оказавшиеся в один момент
+        // на одинаковых координатах, оба сопоставлялись бы с первым
+        // подходящим элементом (см. подробности у matchElement).
+        var claimed: [pid_t: [AXUIElement]] = [:]
         var depth = 0
 
         for info in list {
@@ -752,8 +832,12 @@ final class Controller: NSObject, NSApplicationDelegate {
                 continue
             }
 
-            guard let match = windows.first(where: { close(axFrame(of: $0), frame) })
+            let taken = claimed[pid] ?? []
+            let title = info[kCGWindowName as String] as? String
+            guard let match = matchElement(among: windows, frame: frame, title: title, taken: taken)
             else { continue }
+            claimed[pid] = taken + [match]
+
             if isMinimized(match) { continue }
             // панели, всплывашки и диалоги тоже мимо: берём только обычные окна
             if !isStandardWindow(match) { continue }
@@ -765,11 +849,84 @@ final class Controller: NSObject, NSApplicationDelegate {
                     pid: pid, element: match, frame: frame,
                     center: CGPoint(x: frame.midX, y: frame.midY), depth: depth,
                     windowID: windowID, isFullScreenNow: isFullScreen(match, frame: frame),
+                    isResizable: isResizable(match),
                     owner: owner.localizedName ?? "?"))
             depth += 1
         }
 
         return found
+    }
+
+    // Системный список окон (CGWindowList) и Accessibility — два независимых
+    // взгляда на одни и те же окна, и общего идентификатора между ними
+    // публичный API не даёт. Приходится сопоставлять по тому, что видно
+    // с обеих сторон: программа-владелец, координаты, заголовок.
+    //
+    // Наивное «первый элемент, чья рамка совпала» ломается ровно в том
+    // случае, ради которого вся раскладка и затевалась: пользователь
+    // переставляет окно клавишами на место другого окна ТОЙ ЖЕ программы.
+    // На один такт опроса оба окна стоят на одинаковых координатах, оба
+    // сопоставляются с одним и тем же элементом Accessibility — и раскладка
+    // дважды двигает одно окно, а второе не двигает никогда. Оно остаётся
+    // не на своём месте, на следующем такте это снова считается ручным
+    // вмешательством, и так до бесконечности: окна слипаются в одной
+    // четверти, а журнал заполняется пересчётом по нескольку раз в секунду.
+    //
+    // Поэтому: (1) заголовок сильнее координат — два окна одной программы
+    // на одном месте почти всегда отличаются заголовком; (2) из совпавших
+    // по координатам берём ближайшее, а не первое попавшееся; (3) уже
+    // занятый другим окном элемент второй раз не отдаём.
+    private func matchElement(
+        among windows: [AXUIElement], frame: CGRect, title: String?, taken: [AXUIElement]
+    ) -> AXUIElement? {
+        let free = windows.filter { candidate in
+            !taken.contains { CFEqual($0, candidate) }
+        }
+        guard !free.isEmpty else { return nil }
+
+        if let title, !title.isEmpty {
+            let sameTitle = free.filter { axTitle(of: $0) == title }
+            if sameTitle.count == 1 { return sameTitle[0] }
+            // одинаковый заголовок у нескольких окон — разбираем координатами
+            if sameTitle.count > 1 {
+                return nearest(in: sameTitle, to: frame)
+            }
+        }
+        return nearest(in: free, to: frame)
+    }
+
+    private func nearest(in windows: [AXUIElement], to frame: CGRect) -> AXUIElement? {
+        var best: (element: AXUIElement, distance: CGFloat)?
+        for candidate in windows {
+            let other = axFrame(of: candidate)
+            let distance =
+                abs(other.minX - frame.minX) + abs(other.minY - frame.minY)
+                + abs(other.width - frame.width) + abs(other.height - frame.height)
+            if best == nil || distance < best!.distance { best = (candidate, distance) }
+        }
+        // допуск тот же, что и раньше, только теперь по сумме отклонений
+        guard let best, best.distance <= 12 else { return nil }
+        return best.element
+    }
+
+    private func axTitle(of window: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard
+            AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &value) == .success
+        else { return nil }
+        return value as? String
+    }
+
+    // Окна с намертво заданным размером — настройки системы, окна настроек
+    // программ по Command+, и подобные диалоги. Система прямо отвечает, что
+    // размер менять нельзя, так что гадать не приходится.
+    private func isResizable(_ window: AXUIElement) -> Bool {
+        var settable: DarwinBoolean = false
+        guard
+            AXUIElementIsAttributeSettable(window, kAXSizeAttribute as CFString, &settable)
+                == .success
+        else { return true }
+        return settable.boolValue
     }
 
     // Список для перебора (Option+Tab): окно в настоящем системном
