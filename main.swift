@@ -652,9 +652,19 @@ final class Controller: NSObject, NSApplicationDelegate {
 
                 if let targetID = mostOverlapped(win.frame, among: order, excluding: id, byID: byID)
                 {
-                    order.removeAll { $0 == id }
+                    // Номер занятой ячейки берём ДО того, как вынем окно из
+                    // порядка. Иначе при движении вперёд по спирали (окно
+                    // стояло раньше того, чьё место заняло) изъятие сдвигает
+                    // цель на шаг назад, и окно возвращается ровно туда, где
+                    // и было, — перестановка схлопывается сама в себя и не
+                    // происходит вообще ничего. Вживую это выглядело так:
+                    // большое окно из первой ячейки клавишами отправляют
+                    // в правую верхнюю четверть — и оно остаётся на месте.
+                    // В обратную сторону (из мелкой ячейки в крупную) номер
+                    // от изъятия не меняется, поэтому там всё работало.
                     let insertAt = order.firstIndex(of: targetID) ?? order.count
-                    order.insert(id, at: insertAt)
+                    order.removeAll { $0 == id }
+                    order.insert(id, at: min(insertAt, order.count))
                     changed = true
                 }
             }
