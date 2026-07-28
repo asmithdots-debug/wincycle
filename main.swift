@@ -20,10 +20,13 @@
 //
 // Свёрнутые окна пропускаются.
 //
-// Отдельно: новое открытое окно само встраивается в сетку рядом с уже
-// открытыми на том же экране — остальные окна равномерно подвигаются,
-// чтобы освободить ему место. Окна, растянутые почти на весь экран
-// намеренно, сетка не трогает — как и в переборе.
+// Отдельно: новое открытое окно само встраивается в раскладку рядом с уже
+// открытыми на том же экране — по схеме dwindle, как в Hyprland по
+// умолчанию. Первое окно на весь экран, каждое следующее делит пополам
+// ячейку последнего добавленного, направление деления — по пропорциям этой
+// ячейки. Получается спираль: одно большое окно и всё мельче остальные.
+// Окна, растянутые почти на весь экран намеренно, раскладка не трогает —
+// как и в переборе.
 //
 // Сочетания:
 //   Option + Tab         — следующее окно по часовой стрелке
@@ -54,6 +57,15 @@ private enum Key {
 }
 
 private let dimSteps = [15, 25, 35, 45, 55, 70]
+
+// Приложения, чьи окна не попадают ни в перебор, ни в раскладку, даже когда
+// формально проходят все обычные проверки (обычное окно, видимое, полная
+// непрозрачность). Обнаружено на живом примере: фоновое окно VPN-клиента
+// Happ технически неотличимо от настоящего рабочего окна — общего признака
+// для таких окон в системе нет, поэтому решаем точечным списком.
+private let ignoredBundleIDs: Set<String> = [
+    "su.ffg.happ"
+]
 
 // MARK: - Подложка затемнения
 
@@ -115,6 +127,8 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var tilingEnabled = true
     private var knownWindowIDs: Set<CGWindowID> = []
     private var sawInitialWindows = false
+    /// Порядок добавления окон в dwindle-раскладку, отдельно на каждый экран.
+    private var tileOrder: [CGDirectDisplayID: [CGWindowID]] = [:]
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -347,19 +361,33 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: сетка новых окон
+    // MARK: dwindle-тайлинг новых окон
+    //
+    // Раскладка как в Hyprland по умолчанию (dwindle): первое окно занимает
+    // весь экран. Каждое следующее делит пополам ячейку, где сейчас сидит
+    // САМОЕ ПОСЛЕДНЕЕ добавленное окно — старые окна, кроме этого последнего,
+    // свои места не меняют. Направление деления выбирается по пропорциям
+    // самой ячейки: широкая делится вертикальной линией (получаются левая
+    // и правая половины), высокая — горизонтальной (верх и низ). Из-за этого
+    // получается спираль: одно большое окно и всё более мелкие рядом с ним.
     //
     // Тот же опрос раз в треть секунды, что двигает подложку затемнения,
     // заодно следит за появлением новых окон: если открылось окно, которого
-    // не было на прошлом такте, все окна на ЕГО экране (другие мониторы не
-    // трогаем) равномерно раскладываются заново в сетку. Порядок в сетке —
-    // тот же обход по кругу, что и у Option+Tab: получается предсказуемо,
-    // а не как попало.
+    // не было на прошлом такте, оно дописывается в конец списка порядка для
+    // ЕГО экрана (другие мониторы не трогаем) и вся раскладка на этом экране
+    // пересчитывается по новому списку.
     //
-    // Набор окон для сетки — тот же orderedWindows(), что и для перебора,
+    // Порядок нужно где-то хранить между тактами опроса — иначе непонятно,
+    // какое окно «последнее» и чью ячейку делить дальше. Закрывшиеся окна
+    // просто выпадают из списка при следующем открытии нового; сам список
+    // при этом не пересчитывается заново — так что закрытие окна пока не
+    // схлопывает освободившееся место, только следующее открытие использует
+    // актуальный список.
+    //
+    // Набор окон для тайлинга — тот же orderedWindows(), что и для перебора,
     // то есть окно, растянутое почти на весь экран (например, вручную через
-    // Raycast), в сетку не попадёт и останется как есть: раз его размер
-    // выбрали намеренно, сетке трогать его незачем.
+    // Raycast), в раскладку не попадёт и останется как есть: раз его размер
+    // выбрали намеренно, тайлингу трогать его незачем.
 
     private func checkForNewWindows() {
         guard tilingEnabled, !cycling else { return }
@@ -369,7 +397,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         defer { knownWindowIDs = currentIDs }
 
         // Первый такт после запуска — не «все окна только что открылись»,
-        // а просто исходное состояние экрана. Раскладывать по сетке то, что
+        // а просто исходное состояние экрана. Раскладывать заново то, что
         // уже стояло на местах до запуска WinCycle, никто не просил.
         guard sawInitialWindows else {
             sawInitialWindows = true
@@ -377,14 +405,46 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         let newIDs = currentIDs.subtracting(knownWindowIDs)
-        guard !newIDs.isEmpty,
-            let newWindow = current.first(where: { newIDs.contains($0.windowID) }),
-            let screen = screenContaining(newWindow.center)
-        else { return }
+        guard !newIDs.isEmpty else { return }
+        // Новых окон в одном такте почти всегда одно, но на случай, если
+        // открылось сразу несколько, добавляем все — по возрастанию номера
+        // окна, чтобы порядок был стабильным, а не зависел от CGWindowList.
+        let newOnes = current.filter { newIDs.contains($0.windowID) }.sorted {
+            $0.windowID < $1.windowID
+        }
 
-        let onScreen = current.filter { screenContaining($0.center) === screen }
-        guard onScreen.count > 1 else { return }
-        tileWindows(onScreen, on: screen)
+        for newWindow in newOnes {
+            guard let screen = screenContaining(newWindow.center),
+                let id = screenID(screen)
+            else { continue }
+            var order = tileOrder[id] ?? []
+            if !order.contains(newWindow.windowID) { order.append(newWindow.windowID) }
+            tileOrder[id] = order
+        }
+
+        // Пересчитываем раскладку только на экранах, где реально что-то
+        // появилось — остальные не трогаем, даже если там тоже есть окна.
+        let screens = Set(newOnes.compactMap { screenContaining($0.center) })
+        for screen in screens {
+            guard let id = screenID(screen) else { continue }
+            let onScreen = current.filter { screenContaining($0.center) === screen }
+            let byID = Dictionary(uniqueKeysWithValues: onScreen.map { ($0.windowID, $0) })
+
+            // Список порядка мог накопить окна, которых уже нет на экране
+            // (закрылись, свернулись, стали занимать весь экран) — чистим
+            // его перед раскладкой и заодно приписываем в конец те, что
+            // почему-то оказались на экране, минуя наше отслеживание
+            // (например, существовали ещё до запуска WinCycle).
+            var order = (tileOrder[id] ?? []).filter { byID[$0] != nil }
+            for win in onScreen where !order.contains(win.windowID) {
+                order.append(win.windowID)
+            }
+            tileOrder[id] = order
+
+            let ordered = order.compactMap { byID[$0] }
+            guard ordered.count > 1 else { continue }
+            tileWindows(ordered, on: screen)
+        }
     }
 
     // NSScreen работает в кокоавских координатах (низ слева, экраны как
@@ -403,38 +463,67 @@ final class Controller: NSObject, NSApplicationDelegate {
         NSScreen.screens.first { axRect(for: $0.frame).contains(point) }
     }
 
-    // Равномерная сетка без пустот: количество столбцов — квадратный корень
-    // из числа окон с округлением вверх, строк — сколько получится. Если
-    // последняя строка неполная, её окна берут себе всю ширину поровну между
-    // собой, а не оставляют пустое место с краю.
-    private func tileWindows(_ windows: [WinRef], on screen: NSScreen) {
-        let area = axRect(for: screen.visibleFrame)
-        let n = windows.count
-        let cols = Int(ceil(sqrt(Double(n))))
-        let rows = Int(ceil(Double(n) / Double(cols)))
-        let cellHeight = area.height / CGFloat(rows)
+    // Идентификатор экрана для хранения порядка окон между тактами опроса —
+    // сам NSScreen пересоздаётся при смене конфигурации мониторов, а этот
+    // номер (CGDirectDisplayID) стабилен, пока экран физически не отключат.
+    private func screenID(_ screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
+            .uint32Value
+    }
 
-        var i = 0
-        for row in 0..<rows {
-            let rowCount = min(cols, n - row * cols)
-            guard rowCount > 0 else { break }
-            let cellWidth = area.width / CGFloat(rowCount)
+    // Разбивает область на n прямоугольников по правилу dwindle: каждый
+    // следующий делит пополам то, что осталось после предыдущего, — кроме
+    // самого последнего, который забирает весь оставшийся остаток целиком.
+    private func dwindleRects(count n: Int, in area: CGRect) -> [CGRect] {
+        guard n > 0 else { return [] }
+        var rects: [CGRect] = []
+        var remaining = area
 
-            for col in 0..<rowCount {
-                var pos = CGPoint(
-                    x: area.minX + CGFloat(col) * cellWidth,
-                    y: area.minY + CGFloat(row) * cellHeight)
-                var size = CGSize(width: cellWidth, height: cellHeight)
-                let posVal = AXValueCreate(.cgPoint, &pos)!
-                let sizeVal = AXValueCreate(.cgSize, &size)!
-                AXUIElementSetAttributeValue(
-                    windows[i].element, kAXPositionAttribute as CFString, posVal)
-                AXUIElementSetAttributeValue(
-                    windows[i].element, kAXSizeAttribute as CFString, sizeVal)
-                i += 1
+        for i in 0..<n {
+            if i == n - 1 {
+                rects.append(remaining)
+                break
+            }
+            if remaining.width >= remaining.height {
+                let half = remaining.width / 2
+                rects.append(
+                    CGRect(
+                        x: remaining.minX, y: remaining.minY, width: half,
+                        height: remaining.height))
+                remaining = CGRect(
+                    x: remaining.minX + half, y: remaining.minY,
+                    width: remaining.width - half, height: remaining.height)
+            } else {
+                let half = remaining.height / 2
+                rects.append(
+                    CGRect(
+                        x: remaining.minX, y: remaining.minY, width: remaining.width,
+                        height: half))
+                remaining = CGRect(
+                    x: remaining.minX, y: remaining.minY + half,
+                    width: remaining.width, height: remaining.height - half)
             }
         }
-        log("сетка: \(n) окон, \(cols)×\(rows) — " + windows.map(\.owner).joined(separator: ", "))
+        return rects
+    }
+
+    // windows должен быть в порядке добавления: windows[0] — самое старое
+    // окно на этом экране, оно получает первый (самый большой) кусок.
+    private func tileWindows(_ windows: [WinRef], on screen: NSScreen) {
+        let area = axRect(for: screen.visibleFrame)
+        let rects = dwindleRects(count: windows.count, in: area)
+
+        for (win, rect) in zip(windows, rects) {
+            var pos = rect.origin
+            var size = rect.size
+            let posVal = AXValueCreate(.cgPoint, &pos)!
+            let sizeVal = AXValueCreate(.cgSize, &size)!
+            AXUIElementSetAttributeValue(win.element, kAXPositionAttribute as CFString, posVal)
+            AXUIElementSetAttributeValue(win.element, kAXSizeAttribute as CFString, sizeVal)
+        }
+        log(
+            "dwindle: \(windows.count) окон — "
+                + windows.map(\.owner).joined(separator: ", "))
     }
 
     // MARK: список окон
@@ -477,6 +566,9 @@ final class Controller: NSObject, NSApplicationDelegate {
             // Command+H прячет программу, но её окна остаются в системном
             // списке — просто без изображения. В перебор их брать не нужно.
             if owner.isHidden { continue }
+            if let bundleID = owner.bundleIdentifier, ignoredBundleIDs.contains(bundleID) {
+                continue
+            }
 
             guard let match = windows.first(where: { close(axFrame(of: $0), frame) })
             else { continue }
@@ -647,7 +739,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         let tiling = NSMenuItem(
-            title: "Вписывать новые окна в сетку", action: #selector(toggleTiling),
+            title: "Вписывать новые окна в раскладку", action: #selector(toggleTiling),
             keyEquivalent: "")
         tiling.target = self
         tiling.state = tilingEnabled ? .on : .off
