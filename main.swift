@@ -504,9 +504,23 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         let current = collectWindows(from: windowList())
         let byID = Dictionary(uniqueKeysWithValues: current.map { ($0.windowID, $0) })
-        for id in tileOrder[did] ?? [] where id != win.windowID {
-            guard let other = byID[id] else { continue }
+        let others = (tileOrder[did] ?? []).compactMap { id -> WinRef? in
+            id != win.windowID ? byID[id] : nil
+        }
+
+        // AXRaise поднимает окно только ВНУТРИ его же приложения — на самом
+        // переднем плане экрана оно всё равно останется позади растянутого,
+        // пока не активировано само приложение. Раздельные проходы (сначала
+        // все raise, потом activate) не помогли: система, похоже, не
+        // успевает осознать предыдущую перестановку раньше, чем прилетает
+        // следующая, и реально наверх пробивается только самое последнее
+        // окно в очереди — остальные так и остаются позади растянутого.
+        // Каждому окну даём немного времени осесть, прежде чем поднимать
+        // следующее — держит raise и activate вместе, как для одного окна.
+        for other in others {
             AXUIElementPerformAction(other.element, kAXRaiseAction as CFString)
+            NSRunningApplication(processIdentifier: other.pid)?.activate(options: [])
+            Thread.sleep(forTimeInterval: 0.03)
         }
         focus(win)
         return true
