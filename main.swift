@@ -20,6 +20,11 @@
 //
 // Свёрнутые окна пропускаются.
 //
+// Отдельно: новое открытое окно само встраивается в сетку рядом с уже
+// открытыми на том же экране — остальные окна равномерно подвигаются,
+// чтобы освободить ему место. Окна, растянутые почти на весь экран
+// намеренно, сетка не трогает — как и в переборе.
+//
 // Сочетания:
 //   Option + Tab         — следующее окно по часовой стрелке
 //   Option + Shift + Tab — против часовой
@@ -37,6 +42,7 @@ struct WinRef {
     let center: CGPoint
     /// Положение в системном списке окон: 0 — самое переднее.
     let depth: Int
+    let windowID: CGWindowID
     /// Только для журнала.
     let owner: String
 }
@@ -44,6 +50,7 @@ struct WinRef {
 private enum Key {
     static let dimEnabled = "wincycle.dimEnabled"
     static let dimLevel = "wincycle.dimLevel"
+    static let tilingEnabled = "wincycle.tilingEnabled"
 }
 
 private let dimSteps = [15, 25, 35, 45, 55, 70]
@@ -105,6 +112,10 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var dimEnabled = true
     private var dimLevel = 35
 
+    private var tilingEnabled = true
+    private var knownWindowIDs: Set<CGWindowID> = []
+    private var sawInitialWindows = false
+
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
@@ -123,10 +134,11 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         let defaults = UserDefaults.standard
         defaults.register(defaults: [
-            Key.dimEnabled: true, Key.dimLevel: 35,
+            Key.dimEnabled: true, Key.dimLevel: 35, Key.tilingEnabled: true,
         ])
         dimEnabled = defaults.bool(forKey: Key.dimEnabled)
         dimLevel = defaults.integer(forKey: Key.dimLevel)
+        tilingEnabled = defaults.bool(forKey: Key.tilingEnabled)
 
         log("запуск, доступ выдан: \(AXIsProcessTrusted())")
         requestAccessibility()
@@ -154,6 +166,7 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         let timer = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
             self?.updateDimming(force: false)
+            self?.checkForNewWindows()
         }
         RunLoop.main.add(timer, forMode: .common)
         dimTimer = timer
@@ -334,6 +347,96 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: сетка новых окон
+    //
+    // Тот же опрос раз в треть секунды, что двигает подложку затемнения,
+    // заодно следит за появлением новых окон: если открылось окно, которого
+    // не было на прошлом такте, все окна на ЕГО экране (другие мониторы не
+    // трогаем) равномерно раскладываются заново в сетку. Порядок в сетке —
+    // тот же обход по кругу, что и у Option+Tab: получается предсказуемо,
+    // а не как попало.
+    //
+    // Набор окон для сетки — тот же orderedWindows(), что и для перебора,
+    // то есть окно, растянутое почти на весь экран (например, вручную через
+    // Raycast), в сетку не попадёт и останется как есть: раз его размер
+    // выбрали намеренно, сетке трогать его незачем.
+
+    private func checkForNewWindows() {
+        guard tilingEnabled, !cycling else { return }
+
+        let current = orderedWindows()
+        let currentIDs = Set(current.map(\.windowID))
+        defer { knownWindowIDs = currentIDs }
+
+        // Первый такт после запуска — не «все окна только что открылись»,
+        // а просто исходное состояние экрана. Раскладывать по сетке то, что
+        // уже стояло на местах до запуска WinCycle, никто не просил.
+        guard sawInitialWindows else {
+            sawInitialWindows = true
+            return
+        }
+
+        let newIDs = currentIDs.subtracting(knownWindowIDs)
+        guard !newIDs.isEmpty,
+            let newWindow = current.first(where: { newIDs.contains($0.windowID) }),
+            let screen = screenContaining(newWindow.center)
+        else { return }
+
+        let onScreen = current.filter { screenContaining($0.center) === screen }
+        guard onScreen.count > 1 else { return }
+        tileWindows(onScreen, on: screen)
+    }
+
+    // NSScreen работает в кокоавских координатах (низ слева, экраны как
+    // попало), а окна мы двигаем через Accessibility, где координаты общие
+    // для всех экранов сразу и растут вниз от верхней границы главного
+    // экрана. axRect переводит рамку экрана в эту же систему счисления, что
+    // и мы уже делали при определении фуллскрина.
+    private func axRect(for cocoaRect: CGRect) -> CGRect {
+        let flipBase = NSScreen.screens.first?.frame.maxY ?? 0
+        return CGRect(
+            x: cocoaRect.origin.x, y: flipBase - cocoaRect.origin.y - cocoaRect.height,
+            width: cocoaRect.width, height: cocoaRect.height)
+    }
+
+    private func screenContaining(_ point: CGPoint) -> NSScreen? {
+        NSScreen.screens.first { axRect(for: $0.frame).contains(point) }
+    }
+
+    // Равномерная сетка без пустот: количество столбцов — квадратный корень
+    // из числа окон с округлением вверх, строк — сколько получится. Если
+    // последняя строка неполная, её окна берут себе всю ширину поровну между
+    // собой, а не оставляют пустое место с краю.
+    private func tileWindows(_ windows: [WinRef], on screen: NSScreen) {
+        let area = axRect(for: screen.visibleFrame)
+        let n = windows.count
+        let cols = Int(ceil(sqrt(Double(n))))
+        let rows = Int(ceil(Double(n) / Double(cols)))
+        let cellHeight = area.height / CGFloat(rows)
+
+        var i = 0
+        for row in 0..<rows {
+            let rowCount = min(cols, n - row * cols)
+            guard rowCount > 0 else { break }
+            let cellWidth = area.width / CGFloat(rowCount)
+
+            for col in 0..<rowCount {
+                var pos = CGPoint(
+                    x: area.minX + CGFloat(col) * cellWidth,
+                    y: area.minY + CGFloat(row) * cellHeight)
+                var size = CGSize(width: cellWidth, height: cellHeight)
+                let posVal = AXValueCreate(.cgPoint, &pos)!
+                let sizeVal = AXValueCreate(.cgSize, &size)!
+                AXUIElementSetAttributeValue(
+                    windows[i].element, kAXPositionAttribute as CFString, posVal)
+                AXUIElementSetAttributeValue(
+                    windows[i].element, kAXSizeAttribute as CFString, sizeVal)
+                i += 1
+            }
+        }
+        log("сетка: \(n) окон, \(cols)×\(rows) — " + windows.map(\.owner).joined(separator: ", "))
+    }
+
     // MARK: список окон
 
     // Порядок спереди назад даёт CGWindowList, а управлять окнами умеет только
@@ -382,11 +485,13 @@ final class Controller: NSObject, NSApplicationDelegate {
             if !isStandardWindow(match) { continue }
             if isFullScreen(match, frame: frame) { continue }
 
+            guard let windowID = info[kCGWindowNumber as String] as? CGWindowID else { continue }
+
             found.append(
                 WinRef(
                     pid: pid, element: match,
                     center: CGPoint(x: frame.midX, y: frame.midY), depth: depth,
-                    owner: owner.localizedName ?? "?"))
+                    windowID: windowID, owner: owner.localizedName ?? "?"))
             depth += 1
         }
 
@@ -541,6 +646,13 @@ final class Controller: NSObject, NSApplicationDelegate {
             menu.addItem(strength)
         }
 
+        let tiling = NSMenuItem(
+            title: "Вписывать новые окна в сетку", action: #selector(toggleTiling),
+            keyEquivalent: "")
+        tiling.target = self
+        tiling.state = tilingEnabled ? .on : .off
+        menu.addItem(tiling)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
@@ -560,6 +672,12 @@ final class Controller: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(dimLevel, forKey: Key.dimLevel)
         rebuildMenu()
         updateDimming(force: true)
+    }
+
+    @objc private func toggleTiling() {
+        tilingEnabled.toggle()
+        UserDefaults.standard.set(tilingEnabled, forKey: Key.tilingEnabled)
+        rebuildMenu()
     }
 
     @objc private func quit() {
