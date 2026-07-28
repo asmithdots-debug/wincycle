@@ -516,12 +516,36 @@ final class Controller: NSObject, NSApplicationDelegate {
         // всё уже с ними.
         guard sawInitialWindows else {
             sawInitialWindows = true
+            var byScreen: [CGDirectDisplayID: [WinRef]] = [:]
             for win in current {
                 guard win.isResizable, !win.isFullScreenNow,
                     let screen = screenContaining(win.center), let did = screenID(screen)
                 else { continue }
-                tileOrder[did, default: []].append(win.windowID)
-                lastAppliedFrame[win.windowID] = win.frame
+                byScreen[did, default: []].append(win)
+            }
+            for (did, wins) in byScreen {
+                // Порядок восстанавливаем по геометрии, а не по слоям. В
+                // спирали каждая следующая ячейка не больше предыдущей, так
+                // что «от большего к меньшему» воспроизводит исходный порядок
+                // раскладки, если она на экране уже была (а после каждой
+                // пересборки она именно там и есть). Равные по площади —
+                // последняя пара ячеек и окна одной стопки; их разводим по
+                // положению, сверху вниз и слева направо.
+                //
+                // Брать порядок из системного списка окон нельзя: он идёт по
+                // слоям и меняется от любого переключения. Записанный так
+                // порядок не соответствовал реальным ячейкам, и первый же
+                // пересчёт перекладывал всю раскладку заново.
+                let ordered = wins.sorted {
+                    let areaA = $0.frame.width * $0.frame.height
+                    let areaB = $1.frame.width * $1.frame.height
+                    if areaA != areaB { return areaA > areaB }
+                    if $0.frame.minY != $1.frame.minY { return $0.frame.minY < $1.frame.minY }
+                    if $0.frame.minX != $1.frame.minX { return $0.frame.minX < $1.frame.minX }
+                    return $0.windowID < $1.windowID
+                }
+                tileOrder[did] = ordered.map(\.windowID)
+                for win in ordered { lastAppliedFrame[win.windowID] = win.frame }
             }
             return
         }
@@ -719,8 +743,17 @@ final class Controller: NSObject, NSApplicationDelegate {
         byID: [CGWindowID: WinRef]
     ) -> CGWindowID? {
         var best: (id: CGWindowID, ratio: CGFloat)?
+        let ownSlot = lastAppliedFrame[excluding]
         for other in order where other != excluding {
             guard byID[other] != nil, let otherSlot = lastAppliedFrame[other] else { continue }
+            // Соседей по стопке пропускаем: у них с этим окном одна и та же
+            // ячейка, перекрытие всегда полное, и любое мелкое расхождение
+            // рамки внутри стопки читалось бы как «окно заняло чужое место».
+            // Раскладка от этого перетасовывалась сама по себе, окна прыгали
+            // между ячейками — особенно заметно при переборе, когда окно
+            // стопки поднимают на передний план. Перестановка внутри своей
+            // же ячейки перестановкой не является.
+            if let ownSlot, close(ownSlot, otherSlot) { continue }
             let overlap = frame.intersection(otherSlot)
             guard !overlap.isNull else { continue }
             let smaller = min(frame.width * frame.height, otherSlot.width * otherSlot.height)
@@ -842,10 +875,15 @@ final class Controller: NSObject, NSApplicationDelegate {
             appliedAt[win.windowID] = Date()
         }
 
-        // Сверху стопки — самое новое окно: его только что открыли, значит
-        // с ним и собираются работать.
+        // Сверху стопки — то её окно, которое и так впереди остальных по
+        // системному z-порядку. Для только что открытого окна это оно само
+        // (новое окно система кладёт наверх), а для окна, выбранного
+        // перебором, — тоже оно: перебор его поднял. Раньше наверх
+        // безусловно поднималось последнее окно по порядку раскладки, и
+        // любой следующий пересчёт стирал выбор пользователя — только что
+        // найденное перебором окно снова уезжало под стопку.
         let stacked = windows.count - maxTiles + 1
-        if stacked > 1, let top = windows.last {
+        if stacked > 1, let top = windows.suffix(stacked).min(by: { $0.depth < $1.depth }) {
             AXUIElementPerformAction(top.element, kAXRaiseAction as CFString)
         }
         log(
@@ -1022,9 +1060,15 @@ final class Controller: NSObject, NSApplicationDelegate {
         let hub = CGPoint(
             x: windows.map(\.center.x).reduce(0, +) / CGFloat(windows.count),
             y: windows.map(\.center.y).reduce(0, +) / CGFloat(windows.count))
+        // У окон одной стопки центр общий, значит и угол одинаковый. Без
+        // второго признака их взаимный порядок брался бы из входного списка,
+        // а он идёт по z-порядку и меняется от каждого переключения: перебор
+        // застревал между двумя окнами стопки и дальше не шёл. Номер окна
+        // произволен, но постоянен — этого достаточно, чтобы круг замкнулся.
         return windows.sorted {
-            atan2($0.center.y - hub.y, $0.center.x - hub.x)
-                < atan2($1.center.y - hub.y, $1.center.x - hub.x)
+            let a = atan2($0.center.y - hub.y, $0.center.x - hub.x)
+            let b = atan2($1.center.y - hub.y, $1.center.x - hub.x)
+            return a == b ? $0.windowID < $1.windowID : a < b
         }
     }
 
