@@ -46,11 +46,8 @@
 // Остальных ячеек, к перестановке отношения не имевших, это не касается.
 //
 // Сочетания:
-//   Option + Tab                 — следующее окно по часовой стрелке
-//   Option + Shift + Tab         — против часовой
-//   Option + Command + Tab       — поменять активное окно местами со
-//                                   следующим по тому же кругу
-//   Option + Command + Shift + Tab — с предыдущим
+//   Option + Tab         — следующее окно по часовой стрелке
+//   Option + Shift + Tab — против часовой
 //
 // Приватных системных вызовов не использует: порядок окон берётся из
 // CGWindowListCopyWindowInfo, а сами окна сопоставляются с ним по владельцу
@@ -436,13 +433,8 @@ final class Controller: NSObject, NSApplicationDelegate {
                     event, EventParamName(kEventParamDirectObject),
                     EventParamType(typeEventHotKeyID), nil,
                     MemoryLayout<EventHotKeyID>.size, nil, &id)
-                switch id.id {
-                case 1: DispatchQueue.main.async { shared?.step(forward: true) }
-                case 2: DispatchQueue.main.async { shared?.step(forward: false) }
-                case 3: DispatchQueue.main.async { shared?.swap(forward: true) }
-                case 4: DispatchQueue.main.async { shared?.swap(forward: false) }
-                default: break
-                }
+                let forward = id.id == 1
+                DispatchQueue.main.async { shared?.step(forward: forward) }
                 return noErr
             }, 1, &spec, nil, nil)
 
@@ -450,8 +442,6 @@ final class Controller: NSObject, NSApplicationDelegate {
         for (id, modifiers) in [
             (UInt32(1), UInt32(optionKey)),
             (UInt32(2), UInt32(optionKey | shiftKey)),
-            (UInt32(3), UInt32(optionKey | cmdKey)),
-            (UInt32(4), UInt32(optionKey | cmdKey | shiftKey)),
         ] {
             var ref: EventHotKeyRef?
             RegisterEventHotKey(
@@ -506,70 +496,6 @@ final class Controller: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             self.refreshDimming(force: true)
         }
-    }
-
-    // MARK: перестановка местами по клавишам
-    //
-    // Option+Command+Tab — активное окно меняется местами со следующим по
-    // тому же кругу, что и обычный перебор (Option+Tab); Shift — с
-    // предыдущим. С двумя окнами оба направления дают один и тот же
-    // результат — переставляют их местами.
-    //
-    // Это настоящий обмен (в отличие от перестановки, распознанной по
-    // перекрытию рамок — см. раздел 6 в DESIGN.md, там это специально НЕ
-    // обмен, а каскад): здесь пользователь явно просит поменять местами
-    // ровно эти два окна, и «поменять местами» означает именно это —
-    // каждое занимает рамку другого целиком, соседей по дереву не касается.
-    // Меняются местами только сами окна, а не весь список их соседей по
-    // ячейке: если одно из них стоит в стопке, туда, куда оно стояло,
-    // встаёт другое, а остальные окна той же стопки остаются на месте.
-    func swap(forward: Bool) {
-        let list = orderedWindows()
-        guard list.count > 1,
-            let frontID = frontWindowID(in: windowList()),
-            let activeIndex = list.firstIndex(where: { $0.windowID == frontID })
-        else { return }
-        let targetIndex = (activeIndex + (forward ? 1 : -1) + list.count) % list.count
-        let target = list[targetIndex]
-        guard target.windowID != frontID else { return }
-        swapWindows(frontID, target.windowID)
-    }
-
-    private func findLeafAcrossScreens(_ id: CGWindowID) -> (CGDirectDisplayID, TileNode)? {
-        for (did, tree) in trees {
-            if let leaf = findLeaf(tree, containing: id) { return (did, leaf) }
-        }
-        return nil
-    }
-
-    private func swapWindows(_ a: CGWindowID, _ b: CGWindowID) {
-        guard let (didA, leafA) = findLeafAcrossScreens(a),
-            let (didB, leafB) = findLeafAcrossScreens(b),
-            leafA !== leafB,
-            case .leaf(var idsA) = leafA.content, case .leaf(var idsB) = leafB.content,
-            let ia = idsA.firstIndex(of: a), let ib = idsB.firstIndex(of: b)
-        else { return }
-
-        idsA[ia] = b
-        idsB[ib] = a
-        leafA.content = .leaf(idsA)
-        leafB.content = .leaf(idsB)
-
-        let current = collectWindows(from: windowList())
-        let byID = Dictionary(uniqueKeysWithValues: current.map { ($0.windowID, $0) })
-        for did in Set([didA, didB]) {
-            guard let tree = trees[did],
-                let screen = NSScreen.screens.first(where: { screenID($0) == did })
-            else { continue }
-            let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
-            let onScreenByID = Dictionary(
-                uniqueKeysWithValues: current.filter { screenContaining($0.center) === screen }
-                    .map { ($0.windowID, $0) })
-            applyTree(tree, area: area, byID: onScreenByID)
-        }
-        // Клавиатурный фокус остаётся за тем же окном, которое было
-        // активно, — просто на новом месте.
-        if let win = byID[a] { focus(win) }
     }
 
     // MARK: dwindle-тайлинг новых окон
@@ -1495,8 +1421,6 @@ final class Controller: NSObject, NSApplicationDelegate {
         for text in [
             "Option + Tab — по часовой стрелке",
             "Option + Shift + Tab — против часовой",
-            "Option + Command + Tab — поменять местами со следующим",
-            "Option + Command + Shift + Tab — с предыдущим",
         ] {
             let hint = NSMenuItem(title: text, action: nil, keyEquivalent: "")
             hint.isEnabled = false
