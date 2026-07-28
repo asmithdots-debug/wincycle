@@ -21,13 +21,14 @@
 // Свёрнутые окна пропускаются.
 //
 // Отдельно: новое открытое окно само встраивается в раскладку рядом с уже
-// открытыми на том же экране — по схеме dwindle, как в Hyprland по
-// умолчанию. Первое окно на весь экран, каждое следующее делит пополам
-// ячейку последнего добавленного, направление деления — по пропорциям этой
-// ячейки. Получается спираль: одно большое окно и всё мельче остальные.
-// Ячеек не больше пяти: шестое и последующие окна складываются стопкой
-// в последнюю ячейку, сверху — самое новое, до остальных можно добраться
-// перебором Option+Tab.
+// открытыми на том же экране — настоящим деревом разбиений, как в i3/bspwm
+// и в dwindle-режиме Hyprland. Первое окно на весь экран, каждое следующее
+// по умолчанию делит пополам ячейку АКТИВНОГО окна (совпадает с Hyprland:
+// новое окно появляется рядом с тем, с чем человек как раз работает), а не
+// произвольной последней ячейки. Направление деления — по пропорциям самой
+// ячейки. Ячеек не больше пяти: окна сверх лимита складываются стопкой
+// в самую мелкую ячейку, сверху — окно, и так впереди по системному
+// z-порядку, до остальных можно добраться перебором Option+Tab.
 // Между окнами и по краю экрана — зазор 8pt, такой же, как у Raycast Window
 // Management. Раскладку не получают окна в настоящем системном
 // полноэкранном режиме (тот же признак и в переборе) и окна, которым нельзя
@@ -39,8 +40,10 @@
 // Растянули почти на весь экран (Raycast, перетаскиванием и так далее) —
 // временно отпускает его, остальные окна на этом экране пересчитываются на
 // освободившееся место; вернули обычный размер — окно само возвращается.
-// Переставили окно клавишами в четверть/половину, где уже стояло другое
-// отслеживаемое окно, — раскладка меняет их местами и раздвигает заново.
+// Переставили окно клавишами в чужую ячейку — окно вынимается из своего
+// листа (сосед по дереву получает освободившееся место целиком) и ячейка
+// цели делится заново: окно занимает половину, прежний хозяин — другую.
+// Остальных ячеек, к перестановке отношения не имевших, это не касается.
 //
 // Сочетания:
 //   Option + Tab         — следующее окно по часовой стрелке
@@ -69,6 +72,21 @@ struct WinRef {
     let isResizable: Bool
     /// Только для журнала.
     let owner: String
+}
+
+// Дерево разбиений: узел либо лист (одно окно, а при переполнении сверх
+// maxTiles — несколько на одном месте, стопкой), либо разрез на две области.
+// Направление разреза (vertical: true — вертикальная черта, лево/право;
+// false — горизонтальная, верх/низ) решается один раз, в момент деления,
+// и дальше не пересматривается. Подробный разбор — в DESIGN.md и в
+// комментарии перед MARK: тайлинг ниже.
+private final class TileNode {
+    enum Content {
+        case leaf([CGWindowID])
+        case split(vertical: Bool, TileNode, TileNode)
+    }
+    var content: Content
+    init(_ content: Content) { self.content = content }
 }
 
 private enum Key {
@@ -162,8 +180,8 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var tilingEnabled = true
     private var knownWindowIDs: Set<CGWindowID> = []
     private var sawInitialWindows = false
-    /// Порядок добавления окон в dwindle-раскладку, отдельно на каждый экран.
-    private var tileOrder: [CGDirectDisplayID: [CGWindowID]] = [:]
+    /// Дерево разбиений на каждом экране — см. TileNode выше.
+    private var trees: [CGDirectDisplayID: TileNode] = [:]
     /// Рамка, которую раскладка сама поставила каждому отслеживаемому окну —
     /// нужна, чтобы отличить «это раскладка его так растянула» от «кто-то
     /// подвинул или растянул окно сам, пока мы не смотрели».
@@ -179,6 +197,13 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// Окна с фиксированным размером, которые раскладка уже поставила по
     /// центру. Повторно не трогаем: пользователь мог отодвинуть окно сам.
     private var centered: Set<CGWindowID> = []
+    /// Переднее окно на конец ПРОШЛОГО такта — то, что было активно до
+    /// появления нового окна. К моменту, когда опрос вообще замечает новое
+    /// окно, оно почти всегда уже само стало передним (открытие документа
+    /// само крадёт фокус) — свежий front на этом такте показал бы само новое
+    /// окно, а не то, где человек работал секунду назад. Используется только
+    /// для выбора цели вставки нового окна, не для затемнения.
+    private var lastObservedFrontID: CGWindowID?
 
     // MARK: кэши снимка окон
     //
@@ -279,9 +304,12 @@ final class Controller: NSObject, NSApplicationDelegate {
             // с Accessibility делалась дважды за каждый такт.
             let list = self.windowList()
             let current = self.collectWindows(from: list)
+            let front = self.frontWindowID(in: list)
+            let previousFront = self.lastObservedFrontID
             self.updateDimming(list: list, windows: current, force: false)
-            self.checkForNewWindows(current: current)
-            self.watchManualResize(current: current)
+            self.checkForNewWindows(current: current, frontID: previousFront)
+            self.watchManualResize(current: current, frontID: front)
+            if let front { self.lastObservedFrontID = front }
         }
         RunLoop.main.add(timer, forMode: .common)
         dimTimer = timer
@@ -512,7 +540,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     // единственным, и окно, которое приложение просто восстановило из
     // прошлой сессии в старой большой рамке.
 
-    private func checkForNewWindows(current: [WinRef]) {
+    private func checkForNewWindows(current: [WinRef], frontID: CGWindowID?) {
         guard tilingEnabled, !cycling else { return }
 
         let currentIDs = Set(current.map(\.windowID))
@@ -557,6 +585,10 @@ final class Controller: NSObject, NSApplicationDelegate {
                 byScreen[did, default: []].append(win)
             }
             for (did, wins) in byScreen {
+                guard let screen = NSScreen.screens.first(where: { screenID($0) == did })
+                else { continue }
+                let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
+
                 // Порядок восстанавливаем по геометрии, а не по слоям. В
                 // спирали каждая следующая ячейка не больше предыдущей, так
                 // что «от большего к меньшему» воспроизводит исходный порядок
@@ -577,8 +609,16 @@ final class Controller: NSObject, NSApplicationDelegate {
                     if $0.frame.minX != $1.frame.minX { return $0.frame.minX < $1.frame.minX }
                     return $0.windowID < $1.windowID
                 }
-                tileOrder[did] = ordered.map(\.windowID)
-                for win in ordered { lastAppliedFrame[win.windowID] = win.frame }
+
+                // Дерево строится тем же способом, что и обычный рост (см.
+                // insertNew), но реальные рамки окон не трогаем — окна и так
+                // стоят там, где стоят, просто теперь под наблюдением.
+                var tree: TileNode?
+                for win in ordered {
+                    insertNew(win.windowID, into: &tree, area: area, preferredTarget: nil)
+                    lastAppliedFrame[win.windowID] = win.frame
+                }
+                trees[did] = tree
             }
             return
         }
@@ -587,12 +627,19 @@ final class Controller: NSObject, NSApplicationDelegate {
         centered.formIntersection(currentIDs)
         guard !newIDs.isEmpty || !closedIDs.isEmpty else { return }
         let newOnes = current.filter { newIDs.contains($0.windowID) }
+        let byID = Dictionary(uniqueKeysWithValues: current.map { ($0.windowID, $0) })
 
         // Окна с фиксированным размером в раскладку не берём — их всё равно
         // не растянуть под ячейку. Вместо этого ставим по центру экрана
         // поверх остальных: так их видно целиком и не приходится искать.
         for win in newOnes where !win.isResizable {
             centerOnTop(win)
+        }
+
+        for closedID in closedIDs {
+            for did in trees.keys {
+                trees[did] = trees[did].flatMap { removing(closedID, from: $0) }
+            }
         }
 
         // Экраны для пересчёта: те, где появилось новое окно, — они уже
@@ -603,19 +650,10 @@ final class Controller: NSObject, NSApplicationDelegate {
         // холостой пересчёт дешевле, чем пропущенное схлопывание пустоты.
         var screens = Set(newOnes.compactMap { screenContaining($0.center) })
         if !closedIDs.isEmpty {
-            // Экран закрывшегося окна спросить уже не у кого — окна нет.
-            // Берём все экраны, где сейчас есть окна, плюс те, за которыми
-            // раскладка уже следит (последний нужен, чтобы опустевший экран
-            // не остался с записью о несуществующих окнах). Раньше здесь были
-            // только экраны из tileOrder — и если раскладка ещё пуста (сразу
-            // после запуска WinCycle, когда окна на экране уже стояли), то
-            // закрытие окна не приводило вообще ни к чему: пересчитывать
-            // было нечего, а подхватить уже открытые окна этот путь не мог.
-            // Раскладка оживала только при открытии следующего нового окна.
             for win in current {
                 if let screen = screenContaining(win.center) { screens.insert(screen) }
             }
-            for did in tileOrder.keys {
+            for did in trees.keys {
                 if let screen = NSScreen.screens.first(where: { screenID($0) == did }) {
                     screens.insert(screen)
                 }
@@ -624,22 +662,41 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         for screen in screens {
             guard let id = screenID(screen) else { continue }
+            let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
             let onScreen = current.filter { screenContaining($0.center) === screen }
-            let byID = Dictionary(uniqueKeysWithValues: onScreen.map { ($0.windowID, $0) })
-
+            let onScreenByID = Dictionary(uniqueKeysWithValues: onScreen.map { ($0.windowID, $0) })
             let floatedHere = floated[id] ?? []
-            var order = (tileOrder[id] ?? []).filter { byID[$0] != nil }
-            for win in onScreen where !order.contains(win.windowID) {
-                if win.isFullScreenNow || floatedHere.contains(win.windowID) { continue }
-                if !win.isResizable { continue }
-                order.append(win.windowID)
-            }
-            tileOrder[id] = order
 
-            let ordered = order.compactMap { byID[$0] }
-            guard !ordered.isEmpty else { continue }
-            tileWindows(ordered, on: screen)
+            var tree = trees[id]
+            for win in onScreen
+            where win.isResizable && !win.isFullScreenNow && !floatedHere.contains(win.windowID)
+                && findLeaf(tree, containing: win.windowID) == nil
+            {
+                let preferred = activeLeaf(tree: tree, frontID: frontID, byID: byID, on: screen)
+                insertNew(win.windowID, into: &tree, area: area, preferredTarget: preferred)
+            }
+            trees[id] = tree
+
+            if let tree {
+                applyTree(tree, area: area, byID: onScreenByID)
+            } else {
+                log("раскладка на экране опустела")
+            }
         }
+    }
+
+    /// Лист активного (переднего) окна, если оно отслеживается на этом же
+    /// экране, — цель по умолчанию для новых окон. Если активное окно на
+    /// другом экране или не отслеживается вовсе (не обычное окно, ещё не
+    /// подхвачено), возвращающий nil означает «взять хвост спирали»,
+    /// как и раньше.
+    private func activeLeaf(
+        tree: TileNode?, frontID: CGWindowID?, byID: [CGWindowID: WinRef], on screen: NSScreen
+    ) -> TileNode? {
+        guard let tree, let frontID, let front = byID[frontID],
+            screenContaining(front.center) === screen
+        else { return nil }
+        return findLeaf(tree, containing: frontID)
     }
 
     // MARK: ручное изменение размера
@@ -672,20 +729,22 @@ final class Controller: NSObject, NSApplicationDelegate {
     // И наоборот: окно, выведенное как «почти весь экран», продолжаем
     // проверять — как только оно перестаёт быть таким (пользователь сам
     // вернул ему обычный размер), оно тут же возвращается в раскладку.
-    private func watchManualResize(current: [WinRef]) {
+    private func watchManualResize(current: [WinRef], frontID: CGWindowID?) {
         guard tilingEnabled, !cycling else { return }
         let byID = Dictionary(uniqueKeysWithValues: current.map { ($0.windowID, $0) })
 
-        for did in Set(tileOrder.keys).union(floated.keys) {
+        for did in Set(trees.keys).union(floated.keys) {
             guard let screen = NSScreen.screens.first(where: { screenID($0) == did })
             else { continue }
+            let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
 
-            var order = tileOrder[did] ?? []
+            var tree = trees[did]
             // закрывшиеся выведенные окна больше нечего ждать — забываем их
             var floatSet = (floated[did] ?? []).filter { byID[$0] != nil }
             var changed = false
 
-            for id in order {
+            let trackedIDs = tree.map(allWindowIDs) ?? []
+            for id in trackedIDs {
                 guard let win = byID[id], let expected = lastAppliedFrame[id],
                     !close(win.frame, expected)
                 else { continue }
@@ -701,27 +760,16 @@ final class Controller: NSObject, NSApplicationDelegate {
                 if let at = appliedAt[id], Date().timeIntervalSince(at) < settleTime { continue }
 
                 if isNearFullScreenArea(win.frame, on: screen) {
-                    order.removeAll { $0 == id }
+                    tree = tree.flatMap { removing(id, from: $0) }
                     floatSet.insert(id)
                     changed = true
                     continue
                 }
 
-                if let targetID = mostOverlapped(win.frame, among: order, excluding: id, byID: byID)
+                if let targetID = mostOverlapped(
+                    win.frame, among: trackedIDs, excluding: id, byID: byID)
                 {
-                    // Номер занятой ячейки берём ДО того, как вынем окно из
-                    // порядка. Иначе при движении вперёд по спирали (окно
-                    // стояло раньше того, чьё место заняло) изъятие сдвигает
-                    // цель на шаг назад, и окно возвращается ровно туда, где
-                    // и было, — перестановка схлопывается сама в себя и не
-                    // происходит вообще ничего. Вживую это выглядело так:
-                    // большое окно из первой ячейки клавишами отправляют
-                    // в правую верхнюю четверть — и оно остаётся на месте.
-                    // В обратную сторону (из мелкой ячейки в крупную) номер
-                    // от изъятия не меняется, поэтому там всё работало.
-                    let insertAt = order.firstIndex(of: targetID) ?? order.count
-                    order.removeAll { $0 == id }
-                    order.insert(id, at: min(insertAt, order.count))
+                    moveInTree(id, onto: targetID, tree: &tree, area: area)
                     changed = true
                 }
             }
@@ -730,19 +778,22 @@ final class Controller: NSObject, NSApplicationDelegate {
                 guard let win = byID[id], !isNearFullScreenArea(win.frame, on: screen)
                 else { continue }
                 floatSet.remove(id)
-                if !order.contains(id) { order.append(id) }
+                let preferred = activeLeaf(tree: tree, frontID: frontID, byID: byID, on: screen)
+                insertNew(id, into: &tree, area: area, preferredTarget: preferred)
                 changed = true
             }
 
-            tileOrder[did] = order
+            trees[did] = tree
             floated[did] = floatSet
             guard changed else { continue }
 
-            let ordered = order.compactMap { byID[$0] }
-            if ordered.isEmpty {
-                log("dwindle: раскладка на экране опустела")
+            let onScreenByID = Dictionary(
+                uniqueKeysWithValues: current.filter { screenContaining($0.center) === screen }
+                    .map { ($0.windowID, $0) })
+            if let tree {
+                applyTree(tree, area: area, byID: onScreenByID)
             } else {
-                tileWindows(ordered, on: screen)
+                log("раскладка на экране опустела")
             }
         }
     }
@@ -751,7 +802,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     // намеренно» при первом взгляде на окно, — но здесь безопасен, потому что
     // применяется только к окну, чья рамка разошлась с тем, что поставила
     // сама раскладка. Собственное растягивание раскладки под этот случай не
-    // подпадает: сразу после tileWindows() рамка совпадает с lastAppliedFrame.
+    // подпадает: сразу после applyTree() рамка совпадает с lastAppliedFrame.
     private func isNearFullScreenArea(_ frame: CGRect, on screen: NSScreen) -> Bool {
         let visibleArea = screen.visibleFrame.width * screen.visibleFrame.height
         guard visibleArea > 0 else { return false }
@@ -823,48 +874,6 @@ final class Controller: NSObject, NSApplicationDelegate {
             .uint32Value
     }
 
-    // Разбивает область на n прямоугольников по правилу dwindle: каждый
-    // следующий делит пополам то, что осталось после предыдущего, — кроме
-    // самого последнего, который забирает весь оставшийся остаток целиком.
-    // Зазор встроен прямо в место деления: между двумя кусками, полученными
-    // из одного разреза, остаётся ровно tileGap — не важно, на каком уровне
-    // спирали это произошло. Отступ от края экрана даёт не эта функция,
-    // а урезанная область, которую ей передают (см. tileWindows).
-    private func dwindleRects(count n: Int, in area: CGRect) -> [CGRect] {
-        guard n > 0 else { return [] }
-        var rects: [CGRect] = []
-        var remaining = area
-
-        for i in 0..<n {
-            if i == n - 1 {
-                rects.append(remaining)
-                break
-            }
-            if remaining.width >= remaining.height {
-                let half = (remaining.width - tileGap) / 2
-                rects.append(
-                    CGRect(
-                        x: remaining.minX, y: remaining.minY, width: half,
-                        height: remaining.height))
-                remaining = CGRect(
-                    x: remaining.minX + half + tileGap, y: remaining.minY,
-                    width: remaining.width - half - tileGap, height: remaining.height)
-            } else {
-                let half = (remaining.height - tileGap) / 2
-                rects.append(
-                    CGRect(
-                        x: remaining.minX, y: remaining.minY, width: remaining.width,
-                        height: half))
-                remaining = CGRect(
-                    x: remaining.minX, y: remaining.minY + half + tileGap,
-                    width: remaining.width, height: remaining.height - half - tileGap)
-            }
-        }
-        return rects
-    }
-
-    // windows должен быть в порядке добавления: windows[0] — самое старое
-    // окно на этом экране, оно получает первый (самый большой) кусок.
     // Окно с фиксированным размером ставим по центру его экрана и поднимаем
     // над остальными. Размер не трогаем вовсе — его и нельзя менять, ради
     // этого окно и выведено из раскладки.
@@ -884,45 +893,203 @@ final class Controller: NSObject, NSApplicationDelegate {
         log("по центру поверх остальных (размер фиксированный): \(win.owner)")
     }
 
-    // Ячеек в раскладке не больше maxTiles: дальше делить нечего, окна
-    // становятся нечитаемыми. Всё, что сверх, складывается стопкой в
-    // последнюю (самую маленькую) ячейку — видно верхнее окно стопки,
-    // остальные под ним. Ничего не пропадает: перебор Option+Tab и так
-    // ходит по всем окнам, а не только по видимым, так что до спрятанного
-    // окна можно добраться без нового сочетания клавиш. Поднятое окно
-    // перекроет соседей по стопке само, по обычным правилам системы.
-    private func tileWindows(_ windows: [WinRef], on screen: NSScreen) {
-        let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
-        let rects = dwindleRects(count: min(windows.count, maxTiles), in: area)
-        guard !rects.isEmpty else { return }
+    // MARK: дерево разбиений — операции
 
-        for (i, win) in windows.enumerated() {
-            let rect = rects[min(i, rects.count - 1)]
-            var pos = rect.origin
-            var size = rect.size
-            let posVal = AXValueCreate(.cgPoint, &pos)!
-            let sizeVal = AXValueCreate(.cgSize, &size)!
-            AXUIElementSetAttributeValue(win.element, kAXPositionAttribute as CFString, posVal)
-            AXUIElementSetAttributeValue(win.element, kAXSizeAttribute as CFString, sizeVal)
-            lastAppliedFrame[win.windowID] = rect
-            appliedAt[win.windowID] = Date()
+    private func leafCount(_ node: TileNode?) -> Int {
+        guard let node else { return 0 }
+        switch node.content {
+        case .leaf: return 1
+        case .split(_, let a, let b): return leafCount(a) + leafCount(b)
+        }
+    }
+
+    private func allWindowIDs(_ node: TileNode) -> [CGWindowID] {
+        switch node.content {
+        case .leaf(let ids): return ids
+        case .split(_, let a, let b): return allWindowIDs(a) + allWindowIDs(b)
+        }
+    }
+
+    private func findLeaf(_ node: TileNode?, containing id: CGWindowID) -> TileNode? {
+        guard let node else { return nil }
+        switch node.content {
+        case .leaf(let ids):
+            return ids.contains(id) ? node : nil
+        case .split(_, let a, let b):
+            return findLeaf(a, containing: id) ?? findLeaf(b, containing: id)
+        }
+    }
+
+    // Прямоугольники всех листьев с учётом зазора между соседями. Порядок
+    // деления и его направление уже решены на каждом узле заранее (см.
+    // splitting) — здесь только считается геометрия, рекурсивно сверху вниз.
+    private func rects(for node: TileNode, in area: CGRect) -> [(TileNode, CGRect)] {
+        switch node.content {
+        case .leaf:
+            return [(node, area)]
+        case .split(let vertical, let a, let b):
+            let (rectA, rectB) = halves(area, vertical: vertical)
+            return rects(for: a, in: rectA) + rects(for: b, in: rectB)
+        }
+    }
+
+    private func halves(_ area: CGRect, vertical: Bool) -> (CGRect, CGRect) {
+        if vertical {
+            let half = (area.width - tileGap) / 2
+            return (
+                CGRect(x: area.minX, y: area.minY, width: half, height: area.height),
+                CGRect(
+                    x: area.minX + half + tileGap, y: area.minY,
+                    width: area.width - half - tileGap, height: area.height)
+            )
+        }
+        let half = (area.height - tileGap) / 2
+        return (
+            CGRect(x: area.minX, y: area.minY, width: area.width, height: half),
+            CGRect(
+                x: area.minX, y: area.minY + half + tileGap,
+                width: area.width, height: area.height - half - tileGap)
+        )
+    }
+
+    // Самый мелкий лист — хвост спирали. Цель по умолчанию, когда активное
+    // окно не отслеживается, и всегда цель для окон сверх лимита ячеек:
+    // переполнение уходит в самое маленькое место независимо от того, где
+    // сейчас работает пользователь — так же, как раньше в плоском списке.
+    private func tailLeaf(_ node: TileNode, in area: CGRect) -> TileNode {
+        rects(for: node, in: area).min { $0.1.width * $0.1.height < $1.1.width * $1.1.height }!.0
+    }
+
+    // Удаляет окно из дерева. Если оно было единственным в своём листе, узел
+    // схлопывается — сосед по разрезу получает освободившееся место целиком,
+    // а не делит его с кем-то ещё (в этом смысл дерева против прежнего
+    // плоского списка: соседей, не участвовавших в перестановке, не
+    // задевает). Если окон в раскладке не осталось, возвращается nil.
+    private func removing(_ id: CGWindowID, from node: TileNode) -> TileNode? {
+        switch node.content {
+        case .leaf(let ids):
+            let remaining = ids.filter { $0 != id }
+            if remaining.count == ids.count { return node }
+            if remaining.isEmpty { return nil }
+            node.content = .leaf(remaining)
+            return node
+        case .split(let vertical, let a, let b):
+            if findLeaf(a, containing: id) != nil {
+                guard let newA = removing(id, from: a) else { return b }
+                node.content = .split(vertical: vertical, newA, b)
+                return node
+            }
+            if findLeaf(b, containing: id) != nil {
+                guard let newB = removing(id, from: b) else { return a }
+                node.content = .split(vertical: vertical, a, newB)
+                return node
+            }
+            return node
+        }
+    }
+
+    // Делит лист target пополам: прежний хозяин ячейки остаётся в одной
+    // половине, id получает другую. Направление — по пропорциям текущей
+    // рамки target (targetRect считает вызывающий заранее, до вставки).
+    private func splitting(_ target: TileNode, insert id: CGWindowID, targetRect: CGRect) {
+        guard case .leaf(let existing) = target.content else { return }
+        let vertical = targetRect.width >= targetRect.height
+        target.content = .split(
+            vertical: vertical, TileNode(.leaf(existing)), TileNode(.leaf([id])))
+    }
+
+    // Присоединяет окно к стопке листа без деления — когда ячеек уже
+    // максимум и создавать новую нельзя.
+    private func appending(_ id: CGWindowID, to leaf: TileNode) {
+        guard case .leaf(let ids) = leaf.content else { return }
+        leaf.content = .leaf(ids + [id])
+    }
+
+    // Добавляет новое (ранее не отслеживаемое) окно в дерево этого экрана.
+    // preferredTarget — лист активного окна, если оно отслеживается здесь;
+    // nil означает «взять хвост спирали». При достижении maxTiles цель
+    // всегда хвост, независимо от preferredTarget: переполнение не может
+    // расталкивать активную ячейку, для него отведено ровно одно место.
+    private func insertNew(
+        _ id: CGWindowID, into tree: inout TileNode?, area: CGRect, preferredTarget: TileNode?
+    ) {
+        guard let root = tree else {
+            tree = TileNode(.leaf([id]))
+            return
+        }
+        if leafCount(root) >= maxTiles {
+            appending(id, to: tailLeaf(root, in: area))
+            return
+        }
+        let target = preferredTarget ?? tailLeaf(root, in: area)
+        let targetRect = rects(for: root, in: area).first { $0.0 === target }?.1 ?? area
+        splitting(target, insert: id, targetRect: targetRect)
+    }
+
+    // Переставляет уже отслеживаемое окно на место другого (targetID) —
+    // вынимает его из своего листа и вставляет в лист цели. Если после
+    // изъятия в дереве образовалось свободное место (окно было единственным
+    // в своём листе), цель делится пополам, как при появлении нового окна —
+    // прежний хозяин ячейки и переставленное окно получают по половине.
+    // Если места не образовалось (окно было одним из нескольких в стопке —
+    // изъятие одного её не опустошает), делить нечего: окно присоединяется
+    // к листу цели без деления; если цель до этого была обычной ячейкой,
+    // она тоже становится стопкой на двоих. Это единственное отступление от
+    // «дерево, а не список» — задевает только редкий случай перетаскивания
+    // окна из стопки прямо на видимую ячейку, сделано ради простоты.
+    private func moveInTree(
+        _ id: CGWindowID, onto targetID: CGWindowID, tree: inout TileNode?, area: CGRect
+    ) {
+        guard let root = tree, let after = removing(id, from: root) else { return }
+        tree = after
+        guard let targetLeaf = findLeaf(after, containing: targetID) else { return }
+        if leafCount(after) < maxTiles {
+            let targetRect = rects(for: after, in: area).first { $0.0 === targetLeaf }?.1 ?? area
+            splitting(targetLeaf, insert: id, targetRect: targetRect)
+        } else {
+            appending(id, to: targetLeaf)
+        }
+    }
+
+    // Применяет дерево к реальным окнам: считает прямоугольники листьев
+    // и переставляет окна через Accessibility.
+    private func applyTree(_ tree: TileNode, area: CGRect, byID: [CGWindowID: WinRef]) {
+        var owners: [String] = []
+        var stackedCount = 0
+
+        for (leaf, rect) in rects(for: tree, in: area) {
+            guard case .leaf(let ids) = leaf.content else { continue }
+            if ids.count > 1 { stackedCount = ids.count }
+            for id in ids {
+                guard let win = byID[id] else { continue }
+                var pos = rect.origin
+                var size = rect.size
+                let posVal = AXValueCreate(.cgPoint, &pos)!
+                let sizeVal = AXValueCreate(.cgSize, &size)!
+                AXUIElementSetAttributeValue(win.element, kAXPositionAttribute as CFString, posVal)
+                AXUIElementSetAttributeValue(win.element, kAXSizeAttribute as CFString, sizeVal)
+                lastAppliedFrame[id] = rect
+                appliedAt[id] = Date()
+                owners.append(win.owner)
+            }
+            // Сверху стопки — окно, и так впереди остальных по системному
+            // z-порядку. Для только что открытого это оно само (новое окно
+            // система кладёт наверх), для найденного перебором — тоже оно:
+            // перебор его уже поднял. Если поднимать безусловно последнее
+            // по списку, любой следующий пересчёт стирал бы выбор
+            // пользователя — только что найденное перебором окно снова
+            // уезжало бы под стопку.
+            if ids.count > 1,
+                let top = ids.compactMap({ byID[$0] }).min(by: { $0.depth < $1.depth })
+            {
+                AXUIElementPerformAction(top.element, kAXRaiseAction as CFString)
+            }
         }
 
-        // Сверху стопки — то её окно, которое и так впереди остальных по
-        // системному z-порядку. Для только что открытого окна это оно само
-        // (новое окно система кладёт наверх), а для окна, выбранного
-        // перебором, — тоже оно: перебор его поднял. Раньше наверх
-        // безусловно поднималось последнее окно по порядку раскладки, и
-        // любой следующий пересчёт стирал выбор пользователя — только что
-        // найденное перебором окно снова уезжало под стопку.
-        let stacked = windows.count - maxTiles + 1
-        if stacked > 1, let top = windows.suffix(stacked).min(by: { $0.depth < $1.depth }) {
-            AXUIElementPerformAction(top.element, kAXRaiseAction as CFString)
-        }
         log(
-            "dwindle: \(windows.count) окон"
-                + (stacked > 1 ? " (в стопке: \(stacked))" : "") + " — "
-                + windows.map(\.owner).joined(separator: ", "))
+            "раскладка: \(owners.count) окон"
+                + (stackedCount > 1 ? " (в стопке: \(stackedCount))" : "") + " — "
+                + owners.joined(separator: ", "))
     }
 
     // MARK: список окон
