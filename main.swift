@@ -179,6 +179,36 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// Окна с фиксированным размером, которые раскладка уже поставила по
     /// центру. Повторно не трогаем: пользователь мог отодвинуть окно сам.
     private var centered: Set<CGWindowID> = []
+
+    // MARK: кэши снимка окон
+    //
+    // Все решения приложения выводятся из системного списка окон: какие окна
+    // есть, чьи они и где стоят. Пока этот список не изменился, ни одно
+    // решение измениться не может — значит и пересобирать снимок незачем.
+    // Опрос идёт три с лишним раза в секунду, а экран почти всё время стоит
+    // без движения, так что подавляющее большинство тактов заканчивается
+    // сравнением списка с прошлым и выходом.
+    //
+    // Заголовок окна в признак не входит намеренно: у терминала в заголовке
+    // крутится значок ожидания, и признак менялся бы каждый такт, сводя весь
+    // выигрыш на нет.
+    private struct WindowKey: Equatable {
+        let id: CGWindowID
+        let pid: pid_t
+        let frame: CGRect
+    }
+    /// Неизменяемые за время жизни окна свойства — спрашиваются один раз.
+    private struct WindowTraits {
+        let standard: Bool
+        let resizable: Bool
+    }
+    private var lastKeys: [WindowKey] = []
+    private var snapshotCache: [WinRef] = []
+    /// Сопоставление окна из системного списка с элементом Accessibility.
+    /// Оно постоянно на всё время жизни окна, а стоит дорого — по запросу
+    /// рамки и заголовка на каждого кандидата.
+    private var elementFor: [CGWindowID: AXUIElement] = [:]
+    private var traitsFor: [CGWindowID: WindowTraits] = [:]
     /// Окна, пропавшие из снимка ровно на прошлом такте. Закрытыми считаем
     /// только те, что не вернулись и на следующем — см. checkForNewWindows.
     private var missingOnce: Set<CGWindowID> = []
@@ -243,20 +273,23 @@ final class Controller: NSObject, NSApplicationDelegate {
             // клавиш — во время настоящего перебора Option зажат, и признак
             // остаётся на месте.
             if self.cycling, !NSEvent.modifierFlags.contains(.option) { self.cycling = false }
-            self.updateDimming(force: false)
-            // Один и тот же снимок окон на этот такт используют обе задачи —
-            // не запрашивать Accessibility дважды подряд за одно и то же.
-            let current = self.collectWindows()
+            // Системный список окон запрашивается один раз на такт, и снимок
+            // по нему строится тоже один — им пользуются все три задачи.
+            // Раньше затемнение собирало снимок отдельно, так что вся работа
+            // с Accessibility делалась дважды за каждый такт.
+            let list = self.windowList()
+            let current = self.collectWindows(from: list)
+            self.updateDimming(list: list, windows: current, force: false)
             self.checkForNewWindows(current: current)
             self.watchManualResize(current: current)
         }
         RunLoop.main.add(timer, forMode: .common)
         dimTimer = timer
 
-        updateDimming(force: true)
+        refreshDimming(force: true)
     }
 
-    @objc private func appActivated() { updateDimming(force: true) }
+    @objc private func appActivated() { refreshDimming(force: true) }
 
     @objc private func screensChanged() { rebuildOverlays() }
 
@@ -264,7 +297,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         for overlay in overlays { overlay.orderOut(nil) }
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
         lastFront = 0
-        updateDimming(force: true)
+        refreshDimming(force: true)
     }
 
     private func hideOverlays() {
@@ -273,14 +306,8 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     // Самое переднее обычное окно, не считая наших собственных подложек.
-    private func frontWindowID() -> CGWindowID? {
+    private func frontWindowID(in list: [[String: Any]]) -> CGWindowID? {
         let mine = Set(overlays.map { CGWindowID($0.windowNumber) })
-        guard
-            let list = CGWindowListCopyWindowInfo(
-                [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]]
-        else { return nil }
-
         for info in list {
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
                 let number = info[kCGWindowNumber as String] as? CGWindowID,
@@ -294,12 +321,18 @@ final class Controller: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    private func updateDimming(force: Bool) {
+    /// Точка входа для тех, у кого своего снимка нет (уведомления системы).
+    private func refreshDimming(force: Bool) {
+        let list = windowList()
+        updateDimming(list: list, windows: collectWindows(from: list), force: force)
+    }
+
+    private func updateDimming(list: [[String: Any]], windows: [WinRef], force: Bool) {
         guard dimEnabled else {
             hideOverlays()
             return
         }
-        guard let front = frontWindowID() else {
+        guard let front = frontWindowID(in: list) else {
             hideOverlays()
             return
         }
@@ -307,7 +340,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         // одно — не важно, само ли оно так открылось, растянула ли его наша
         // раскладка или пользователь развернул вручную, — сравнивать не с
         // чем, и подложка только мешала бы тёмной полосой по краям.
-        guard collectWindows().count > 1 else {
+        guard windows.count > 1 else {
             hideOverlays()
             return
         }
@@ -433,7 +466,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         // Подложку двигаем сразу, не дожидаясь опроса, иначе на треть секунды
         // затемнённым окажется как раз то окно, на которое мы переключились.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            self.updateDimming(force: true)
+            self.refreshDimming(force: true)
         }
     }
 
@@ -900,25 +933,20 @@ final class Controller: NSObject, NSApplicationDelegate {
     // выше). Порядок — спереди назад, как отдаёт CGWindowList; управлять
     // окнами умеет только Accessibility, поэтому одно сопоставляется
     // с другим по владельцу и рамке.
-    private func collectWindows() -> [WinRef] {
-        guard
-            let list = CGWindowListCopyWindowInfo(
-                [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]]
-        else { return [] }
+    private func windowList() -> [[String: Any]] {
+        (CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]]) ?? []
+    }
 
-        var found: [WinRef] = []
-        var cache: [pid_t: [AXUIElement]] = [:]
-        // Один элемент Accessibility — одному окну из системного списка.
-        // Без этого два окна одной программы, оказавшиеся в один момент
-        // на одинаковых координатах, оба сопоставлялись бы с первым
-        // подходящим элементом (см. подробности у matchElement).
-        var claimed: [pid_t: [AXUIElement]] = [:]
-        var depth = 0
+    private func collectWindows(from list: [[String: Any]]) -> [WinRef] {
+        var keys: [WindowKey] = []
+        var titles: [CGWindowID: String] = [:]
 
         for info in list {
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
                 let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                let id = info[kCGWindowNumber as String] as? CGWindowID,
                 let bounds = info[kCGWindowBounds as String] as? [String: CGFloat]
             else { continue }
 
@@ -928,45 +956,106 @@ final class Controller: NSObject, NSApplicationDelegate {
             // мелочь вроде всплывающих панелек в перебор не берём
             if frame.width < 100 || frame.height < 100 { continue }
 
-            let windows = cache[pid] ?? axWindows(of: pid)
-            cache[pid] = windows
+            keys.append(WindowKey(id: id, pid: pid, frame: frame))
+            if let title = info[kCGWindowName as String] as? String { titles[id] = title }
+        }
 
-            // Программы без своего места в Dock (значки в строке меню, подложки
-            // вроде затемнения Dimsum) формально владеют окнами слоя 0, но
-            // переключаться на них бессмысленно — в переборе им не место.
-            guard let owner = NSRunningApplication(processIdentifier: pid),
+        // Экран не изменился — отдаём прошлый снимок, ни одного обращения
+        // к Accessibility не делаем. Это основной путь: окна почти всё время
+        // просто стоят на местах.
+        if keys == lastKeys { return snapshotCache }
+        lastKeys = keys
+
+        let present = Set(keys.map(\.id))
+        elementFor = elementFor.filter { present.contains($0.key) }
+        traitsFor = traitsFor.filter { present.contains($0.key) }
+
+        var axWindowsOf: [pid_t: [AXUIElement]] = [:]
+        // Один элемент Accessibility — одному окну из системного списка.
+        // Без этого два окна одной программы, оказавшиеся в один момент
+        // на одинаковых координатах, оба сопоставлялись бы с первым
+        // подходящим элементом (см. подробности у matchElement).
+        var claimed: [pid_t: [AXUIElement]] = [:]
+        // Уже известные сопоставления закрепляем до того, как начнём искать
+        // новые: иначе только что открывшееся окно может забрать себе
+        // элемент, давно принадлежащий соседнему.
+        for key in keys where elementFor[key.id] != nil {
+            claimed[key.pid, default: []].append(elementFor[key.id]!)
+        }
+
+        var found: [WinRef] = []
+        var depth = 0
+
+        for key in keys {
+            // Программы без своего места в Dock (значки в строке меню, чужие
+            // подложки) формально владеют окнами слоя 0, но переключаться на
+            // них бессмысленно — в переборе им не место. Свёрнутые окна и
+            // окна программ, спрятанных через Command+H, отдельной проверки
+            // не требуют: система сама убирает их из этого списка.
+            guard let owner = NSRunningApplication(processIdentifier: key.pid),
                 owner.activationPolicy == .regular
             else { continue }
-            // Command+H прячет программу, но её окна остаются в системном
-            // списке — просто без изображения. В перебор их брать не нужно.
-            if owner.isHidden { continue }
             if let bundleID = owner.bundleIdentifier, ignoredBundleIDs.contains(bundleID) {
                 continue
             }
 
-            let taken = claimed[pid] ?? []
-            let title = info[kCGWindowName as String] as? String
-            guard let match = matchElement(among: windows, frame: frame, title: title, taken: taken)
-            else { continue }
-            claimed[pid] = taken + [match]
+            let element: AXUIElement
+            if let known = elementFor[key.id] {
+                element = known
+            } else {
+                let windows = axWindowsOf[key.pid] ?? axWindows(of: key.pid)
+                axWindowsOf[key.pid] = windows
+                guard
+                    let match = matchElement(
+                        among: windows, frame: key.frame, title: titles[key.id],
+                        taken: claimed[key.pid] ?? [])
+                else { continue }
+                claimed[key.pid, default: []].append(match.element)
+                // Запоминаем только уверенное сопоставление. Если пришлось
+                // выбирать из нескольких неразличимых кандидатов, ошибка
+                // закрепилась бы навсегда, — лучше попробовать ещё раз на
+                // следующем изменении, когда окна разъедутся.
+                if match.confident { elementFor[key.id] = match.element }
+                element = match.element
+            }
 
-            if isMinimized(match) { continue }
-            // панели, всплывашки и диалоги тоже мимо: берём только обычные окна
-            if !isStandardWindow(match) { continue }
-
-            guard let windowID = info[kCGWindowNumber as String] as? CGWindowID else { continue }
+            let traits: WindowTraits
+            if let known = traitsFor[key.id] {
+                traits = known
+            } else {
+                traits = WindowTraits(
+                    standard: isStandardWindow(element), resizable: isResizable(element))
+                traitsFor[key.id] = traits
+            }
+            // панели, всплывашки и диалоги мимо: берём только обычные окна
+            guard traits.standard else { continue }
 
             found.append(
                 WinRef(
-                    pid: pid, element: match, frame: frame,
-                    center: CGPoint(x: frame.midX, y: frame.midY), depth: depth,
-                    windowID: windowID, isFullScreenNow: isFullScreen(match, frame: frame),
-                    isResizable: isResizable(match),
+                    pid: key.pid, element: element, frame: key.frame,
+                    center: CGPoint(x: key.frame.midX, y: key.frame.midY), depth: depth,
+                    windowID: key.id,
+                    isFullScreenNow: mightBeFullScreen(key.frame) && isFullScreen(element),
+                    isResizable: traits.resizable,
                     owner: owner.localizedName ?? "?"))
             depth += 1
         }
 
+        snapshotCache = found
         return found
+    }
+
+    // Спрашивать систему о полноэкранном режиме есть смысл только у окна,
+    // которое физически закрывает весь дисплей: настоящий полноэкранный
+    // режим macOS всегда именно такой. Это не догадка о намерении, а
+    // необходимое условие — обычная ячейка раскладки под него не подходит
+    // никогда, и запрос для неё можно не делать вовсе.
+    private func mightBeFullScreen(_ frame: CGRect) -> Bool {
+        guard let screen = screenContaining(CGPoint(x: frame.midX, y: frame.midY))
+        else { return true }
+        let display = screen.frame
+        guard display.width > 0, display.height > 0 else { return true }
+        return (frame.width * frame.height) / (display.width * display.height) > 0.9
     }
 
     // Системный список окон (CGWindowList) и Accessibility — два независимых
@@ -990,21 +1079,23 @@ final class Controller: NSObject, NSApplicationDelegate {
     // занятый другим окном элемент второй раз не отдаём.
     private func matchElement(
         among windows: [AXUIElement], frame: CGRect, title: String?, taken: [AXUIElement]
-    ) -> AXUIElement? {
+    ) -> (element: AXUIElement, confident: Bool)? {
         let free = windows.filter { candidate in
             !taken.contains { CFEqual($0, candidate) }
         }
         guard !free.isEmpty else { return nil }
+        // единственный свободный кандидат — выбирать не из чего, ошибиться негде
+        if free.count == 1 { return (free[0], true) }
 
         if let title, !title.isEmpty {
             let sameTitle = free.filter { axTitle(of: $0) == title }
-            if sameTitle.count == 1 { return sameTitle[0] }
+            if sameTitle.count == 1 { return (sameTitle[0], true) }
             // одинаковый заголовок у нескольких окон — разбираем координатами
             if sameTitle.count > 1 {
-                return nearest(in: sameTitle, to: frame)
+                return nearest(in: sameTitle, to: frame).map { ($0, false) }
             }
         }
-        return nearest(in: free, to: frame)
+        return nearest(in: free, to: frame).map { ($0, false) }
     }
 
     private func nearest(in windows: [AXUIElement], to frame: CGRect) -> AXUIElement? {
@@ -1045,7 +1136,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     // полноэкранном режиме сюда не попадает — оно живёт на отдельном
     // рабочем столе, переключаться на него через Tab всё равно не выйдет.
     private func orderedWindows() -> [WinRef] {
-        sortedClockwise(collectWindows().filter { !$0.isFullScreenNow })
+        sortedClockwise(collectWindows(from: windowList()).filter { !$0.isFullScreenNow })
     }
 
     // Сортировка по кругу: считаем общий центр всех окон и раскладываем их
@@ -1094,20 +1185,17 @@ final class Controller: NSObject, NSApplicationDelegate {
     // прошлой сессии (например, Safari снова открылся в старой растянутой
     // рамке — и повторно не участвовал в раскладке, хотя пользователь его
     // только что открыл заново). Настоящий признак либо есть, либо его нет.
-    private func isFullScreen(_ window: AXUIElement, frame: CGRect) -> Bool {
+    private func isFullScreen(_ window: AXUIElement) -> Bool {
         var value: CFTypeRef?
         return AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &value)
             == .success && (value as? Bool) == true
     }
 
-    private func isMinimized(_ window: AXUIElement) -> Bool {
-        var value: CFTypeRef?
-        guard
-            AXUIElementCopyAttributeValue(
-                window, kAXMinimizedAttribute as CFString, &value) == .success
-        else { return false }
-        return (value as? Bool) ?? false
-    }
+    // Проверки «свёрнуто ли окно» здесь больше нет намеренно: свёрнутые окна
+    // и окна программ, спрятанных через Command+H, система сама убирает из
+    // CGWindowList с флагом «только то, что на экране». Проверено вживую на
+    // обоих способах. Отдельный запрос к Accessibility на каждое окно каждый
+    // такт спрашивал ровно то, что уже сказал системный список.
 
     private func axWindows(of pid: pid_t) -> [AXUIElement] {
         let app = AXUIElementCreateApplication(pid)
@@ -1214,14 +1302,14 @@ final class Controller: NSObject, NSApplicationDelegate {
         dimEnabled.toggle()
         UserDefaults.standard.set(dimEnabled, forKey: Key.dimEnabled)
         rebuildMenu()
-        updateDimming(force: true)
+        refreshDimming(force: true)
     }
 
     @objc private func setDim(_ sender: NSMenuItem) {
         dimLevel = sender.tag
         UserDefaults.standard.set(dimLevel, forKey: Key.dimLevel)
         rebuildMenu()
-        updateDimming(force: true)
+        refreshDimming(force: true)
     }
 
     @objc private func toggleTiling() {
