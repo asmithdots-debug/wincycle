@@ -25,8 +25,15 @@
 // умолчанию. Первое окно на весь экран, каждое следующее делит пополам
 // ячейку последнего добавленного, направление деления — по пропорциям этой
 // ячейки. Получается спираль: одно большое окно и всё мельче остальные.
-// Раскладку не получают только окна в настоящем системном полноэкранном
-// режиме — тот же признак и в переборе.
+// Между окнами и по краю экрана — зазор 8pt, такой же, как у Raycast Window
+// Management. Раскладку не получают только окна в настоящем системном
+// полноэкранном режиме — тот же признак и в переборе.
+//
+// Окно, которое кто-то вручную растянул почти на весь экран (Raycast,
+// перетаскиванием и так далее), раскладка временно отпускает — остальные
+// окна на этом экране тут же пересчитываются, чтобы занять освободившееся
+// место. Как только это окно перестаёт быть почти во весь экран, оно само
+// возвращается в раскладку.
 //
 // Сочетания:
 //   Option + Tab         — следующее окно по часовой стрелке
@@ -42,13 +49,12 @@ import Carbon.HIToolbox
 struct WinRef {
     let pid: pid_t
     let element: AXUIElement
+    let frame: CGRect
     let center: CGPoint
     /// Положение в системном списке окон: 0 — самое переднее.
     let depth: Int
     let windowID: CGWindowID
-    /// Окно занимает почти весь экран прямо сейчас. Не значит «намеренно
-    /// максимизировано пользователем» — так же выглядит и окно, которое
-    /// сама раскладка растянула, будучи единственным на экране.
+    /// Настоящий системный полноэкранный режим (AXFullScreen).
     let isFullScreenNow: Bool
     /// Только для журнала.
     let owner: String
@@ -61,6 +67,11 @@ private enum Key {
 }
 
 private let dimSteps = [15, 25, 35, 45, 55, 70]
+
+// Зазор между окнами и между окном и краем экрана — тот же, что даёт Raycast
+// Window Management при Control+стрелка вверх (измерено вживую: маленькая
+// область показывает выигрыш в отступе именно 8pt со всех сторон).
+private let tileGap: CGFloat = 8
 
 // Приложения, чьи окна не попадают ни в перебор, ни в раскладку, даже когда
 // формально проходят все обычные проверки (обычное окно, видимое, полная
@@ -133,6 +144,14 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var sawInitialWindows = false
     /// Порядок добавления окон в dwindle-раскладку, отдельно на каждый экран.
     private var tileOrder: [CGDirectDisplayID: [CGWindowID]] = [:]
+    /// Рамка, которую раскладка сама поставила каждому отслеживаемому окну —
+    /// нужна, чтобы отличить «это раскладка его так растянула» от «кто-то
+    /// подвинул или растянул окно сам, пока мы не смотрели».
+    private var lastAppliedFrame: [CGWindowID: CGRect] = [:]
+    /// Окна, которые вручную растянули почти на весь экран (например, через
+    /// Raycast) — временно выведены из раскладки, отдельно на каждый экран.
+    /// Возвращаются обратно, как только перестают быть почти во весь экран.
+    private var floated: [CGDirectDisplayID: Set<CGWindowID>] = [:]
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -183,8 +202,13 @@ final class Controller: NSObject, NSApplicationDelegate {
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
 
         let timer = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
-            self?.updateDimming(force: false)
-            self?.checkForNewWindows()
+            guard let self else { return }
+            self.updateDimming(force: false)
+            // Один и тот же снимок окон на этот такт используют обе задачи —
+            // не запрашивать Accessibility дважды подряд за одно и то же.
+            let current = self.collectWindows()
+            self.checkForNewWindows(current: current)
+            self.watchManualResize(current: current)
         }
         RunLoop.main.add(timer, forMode: .common)
         dimTimer = timer
@@ -415,10 +439,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     // единственным, и окно, которое приложение просто восстановило из
     // прошлой сессии в старой большой рамке.
 
-    private func checkForNewWindows() {
+    private func checkForNewWindows(current: [WinRef]) {
         guard tilingEnabled, !cycling else { return }
 
-        let current = collectWindows()
         let currentIDs = Set(current.map(\.windowID))
         defer { knownWindowIDs = currentIDs }
 
@@ -455,9 +478,10 @@ final class Controller: NSObject, NSApplicationDelegate {
             let onScreen = current.filter { screenContaining($0.center) === screen }
             let byID = Dictionary(uniqueKeysWithValues: onScreen.map { ($0.windowID, $0) })
 
+            let floatedHere = floated[id] ?? []
             var order = (tileOrder[id] ?? []).filter { byID[$0] != nil }
             for win in onScreen where !order.contains(win.windowID) {
-                if win.isFullScreenNow { continue }
+                if win.isFullScreenNow || floatedHere.contains(win.windowID) { continue }
                 order.append(win.windowID)
             }
             tileOrder[id] = order
@@ -466,6 +490,76 @@ final class Controller: NSObject, NSApplicationDelegate {
             guard !ordered.isEmpty else { continue }
             tileWindows(ordered, on: screen)
         }
+    }
+
+    // MARK: ручное изменение размера
+
+    // Раскладка запоминает, какую рамку сама поставила каждому окну. Если на
+    // очередном такте фактическая рамка отслеживаемого окна не совпадает
+    // с тем, что мы туда ставили, — значит, кто-то подвинул или растянул его
+    // сам, пока мы не смотрели (пользователь через Raycast, само приложение
+    // и так далее). Если после этого окно стало занимать почти весь экран —
+    // это, скорее всего, намеренный разворот, и раскладке лезть туда не
+    // нужно: окно выводится из раскладки («floated»), а освободившееся место
+    // сразу отдаётся остальным окнам на этом экране.
+    //
+    // И наоборот: окно, выведенное так из раскладки, продолжаем проверять —
+    // как только оно перестаёт быть почти во весь экран (пользователь сам
+    // вернул ему обычный размер), оно тут же возвращается в раскладку.
+    private func watchManualResize(current: [WinRef]) {
+        guard tilingEnabled, !cycling else { return }
+        let byID = Dictionary(uniqueKeysWithValues: current.map { ($0.windowID, $0) })
+
+        for did in Set(tileOrder.keys).union(floated.keys) {
+            guard let screen = NSScreen.screens.first(where: { screenID($0) == did })
+            else { continue }
+
+            var order = tileOrder[did] ?? []
+            // закрывшиеся выведенные окна больше нечего ждать — забываем их
+            var floatSet = (floated[did] ?? []).filter { byID[$0] != nil }
+            var changed = false
+
+            for id in order {
+                guard let win = byID[id] else { continue }
+                if let expected = lastAppliedFrame[id], !close(win.frame, expected),
+                    isNearFullScreenArea(win.frame, on: screen)
+                {
+                    order.removeAll { $0 == id }
+                    floatSet.insert(id)
+                    changed = true
+                }
+            }
+
+            for id in floatSet {
+                guard let win = byID[id], !isNearFullScreenArea(win.frame, on: screen)
+                else { continue }
+                floatSet.remove(id)
+                if !order.contains(id) { order.append(id) }
+                changed = true
+            }
+
+            tileOrder[did] = order
+            floated[did] = floatSet
+            guard changed else { continue }
+
+            let ordered = order.compactMap { byID[$0] }
+            if ordered.isEmpty {
+                log("dwindle: раскладка на экране опустела")
+            } else {
+                tileWindows(ordered, on: screen)
+            }
+        }
+    }
+
+    // Тот же порог, что раньше использовался для угадывания «максимизировано
+    // намеренно» при первом взгляде на окно, — но здесь безопасен, потому что
+    // применяется только к окну, чья рамка разошлась с тем, что поставила
+    // сама раскладка. Собственное растягивание раскладки под этот случай не
+    // подпадает: сразу после tileWindows() рамка совпадает с lastAppliedFrame.
+    private func isNearFullScreenArea(_ frame: CGRect, on screen: NSScreen) -> Bool {
+        let visibleArea = screen.visibleFrame.width * screen.visibleFrame.height
+        guard visibleArea > 0 else { return false }
+        return (frame.width * frame.height) / visibleArea > 0.85
     }
 
     // NSScreen работает в кокоавских координатах (низ слева, экраны как
@@ -495,6 +589,10 @@ final class Controller: NSObject, NSApplicationDelegate {
     // Разбивает область на n прямоугольников по правилу dwindle: каждый
     // следующий делит пополам то, что осталось после предыдущего, — кроме
     // самого последнего, который забирает весь оставшийся остаток целиком.
+    // Зазор встроен прямо в место деления: между двумя кусками, полученными
+    // из одного разреза, остаётся ровно tileGap — не важно, на каком уровне
+    // спирали это произошло. Отступ от края экрана даёт не эта функция,
+    // а урезанная область, которую ей передают (см. tileWindows).
     private func dwindleRects(count n: Int, in area: CGRect) -> [CGRect] {
         guard n > 0 else { return [] }
         var rects: [CGRect] = []
@@ -506,23 +604,23 @@ final class Controller: NSObject, NSApplicationDelegate {
                 break
             }
             if remaining.width >= remaining.height {
-                let half = remaining.width / 2
+                let half = (remaining.width - tileGap) / 2
                 rects.append(
                     CGRect(
                         x: remaining.minX, y: remaining.minY, width: half,
                         height: remaining.height))
                 remaining = CGRect(
-                    x: remaining.minX + half, y: remaining.minY,
-                    width: remaining.width - half, height: remaining.height)
+                    x: remaining.minX + half + tileGap, y: remaining.minY,
+                    width: remaining.width - half - tileGap, height: remaining.height)
             } else {
-                let half = remaining.height / 2
+                let half = (remaining.height - tileGap) / 2
                 rects.append(
                     CGRect(
                         x: remaining.minX, y: remaining.minY, width: remaining.width,
                         height: half))
                 remaining = CGRect(
-                    x: remaining.minX, y: remaining.minY + half,
-                    width: remaining.width, height: remaining.height - half)
+                    x: remaining.minX, y: remaining.minY + half + tileGap,
+                    width: remaining.width, height: remaining.height - half - tileGap)
             }
         }
         return rects
@@ -531,7 +629,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     // windows должен быть в порядке добавления: windows[0] — самое старое
     // окно на этом экране, оно получает первый (самый большой) кусок.
     private func tileWindows(_ windows: [WinRef], on screen: NSScreen) {
-        let area = axRect(for: screen.visibleFrame)
+        let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
         let rects = dwindleRects(count: windows.count, in: area)
 
         for (win, rect) in zip(windows, rects) {
@@ -541,6 +639,7 @@ final class Controller: NSObject, NSApplicationDelegate {
             let sizeVal = AXValueCreate(.cgSize, &size)!
             AXUIElementSetAttributeValue(win.element, kAXPositionAttribute as CFString, posVal)
             AXUIElementSetAttributeValue(win.element, kAXSizeAttribute as CFString, sizeVal)
+            lastAppliedFrame[win.windowID] = rect
         }
         log(
             "dwindle: \(windows.count) окон — "
@@ -604,7 +703,7 @@ final class Controller: NSObject, NSApplicationDelegate {
 
             found.append(
                 WinRef(
-                    pid: pid, element: match,
+                    pid: pid, element: match, frame: frame,
                     center: CGPoint(x: frame.midX, y: frame.midY), depth: depth,
                     windowID: windowID, isFullScreenNow: isFullScreen(match, frame: frame),
                     owner: owner.localizedName ?? "?"))
