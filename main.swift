@@ -85,18 +85,8 @@ struct WinRef {
 // комментарии перед MARK: тайлинг ниже.
 private final class TileNode {
     enum Content {
-        /// Пустой массив — не «нет листа», а свободная ячейка: место есть,
-        /// но сейчас в ней никто не стоит (см. распознавание ручного
-        /// вмешательства — окно может ужаться внутри своей же территории,
-        /// и освободившийся кусок остаётся настоящей ячейкой дерева, а не
-        /// просто пропадает).
         case leaf([CGWindowID])
-        /// ratio — доля площади ПЕРВОГО потомка, 0..1. У большинства узлов
-        /// это 0.5 (обычное деление пополам — новое окно, обычная
-        /// перестановка), но не всегда: когда окно вручную ужимается внутри
-        /// своей ячейки в произвольную долю, раскладка запоминает именно ту
-        /// пропорцию, которую выбрал человек, а не округляет её до половины.
-        case split(vertical: Bool, ratio: CGFloat, TileNode, TileNode)
+        case split(vertical: Bool, TileNode, TileNode)
     }
     var content: Content
     init(_ content: Content) { self.content = content }
@@ -855,37 +845,6 @@ final class Controller: NSObject, NSApplicationDelegate {
                 {
                     moveInTree(id, onto: targetID, tree: &tree, area: area)
                     changed = true
-                    continue
-                }
-
-                // Не нашлось окна, на чьё место встало это, — возможно, оно
-                // занимает уже существующую свободную ячейку (кто-то раньше
-                // ужался и оставил её пустой).
-                if let t = tree, let emptyLeaf = mostOverlappedEmptyLeaf(win.frame, tree: t, area: area)
-                {
-                    moveIntoEmpty(id, target: emptyLeaf, tree: &tree)
-                    changed = true
-                    continue
-                }
-
-                // И то и другое не подошло — возможно, окно просто ужалось
-                // внутри своей же ячейки, ни на кого не претендуя (например,
-                // было одно на всю половину экрана, стало занимать её
-                // четверть). Раньше это никак не распознавалось: сравнивать
-                // было не с кем, раскладка молчала и оставляла дыру там,
-                // откуда окно ушло. Теперь исходная ячейка делится в той
-                // пропорции, которую фактически выбрал человек, а
-                // освободившийся кусок становится настоящей свободной
-                // ячейкой — её займёт следующее новое окно или следующая
-                // перестановка.
-                if let t = tree, let leaf = findLeaf(t, containing: id),
-                    let ownRect = rects(for: t, in: area).first(where: { $0.0 === leaf })?.1,
-                    let split = shrinkSplit(ownRect: ownRect, newFrame: win.frame)
-                {
-                    applyShrinkSplit(
-                        id, leaf: leaf, vertical: split.vertical, ratio: split.ratio,
-                        windowFirst: split.windowFirst)
-                    changed = true
                 }
             }
 
@@ -1010,20 +969,18 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     // MARK: дерево разбиений — операции
 
-    // Занятых ячеек — свободные (leaf([])) не считаются: лимит maxTiles про
-    // видимые окна, а не про геометрию как таковую.
     private func leafCount(_ node: TileNode?) -> Int {
         guard let node else { return 0 }
         switch node.content {
-        case .leaf(let ids): return ids.isEmpty ? 0 : 1
-        case .split(_, _, let a, let b): return leafCount(a) + leafCount(b)
+        case .leaf: return 1
+        case .split(_, let a, let b): return leafCount(a) + leafCount(b)
         }
     }
 
     private func allWindowIDs(_ node: TileNode) -> [CGWindowID] {
         switch node.content {
         case .leaf(let ids): return ids
-        case .split(_, _, let a, let b): return allWindowIDs(a) + allWindowIDs(b)
+        case .split(_, let a, let b): return allWindowIDs(a) + allWindowIDs(b)
         }
     }
 
@@ -1032,68 +989,49 @@ final class Controller: NSObject, NSApplicationDelegate {
         switch node.content {
         case .leaf(let ids):
             return ids.contains(id) ? node : nil
-        case .split(_, _, let a, let b):
+        case .split(_, let a, let b):
             return findLeaf(a, containing: id) ?? findLeaf(b, containing: id)
         }
     }
 
-    private func findEmptyLeaf(_ node: TileNode) -> TileNode? {
-        switch node.content {
-        case .leaf(let ids): return ids.isEmpty ? node : nil
-        case .split(_, _, let a, let b): return findEmptyLeaf(a) ?? findEmptyLeaf(b)
-        }
-    }
-
-    // Прямоугольники всех листьев (включая свободные) с учётом зазора между
-    // соседями. Направление и доля деления уже решены на каждом узле заранее
-    // (см. splitting и applyShrinkSplit) — здесь только считается геометрия,
-    // рекурсивно сверху вниз.
+    // Прямоугольники всех листьев с учётом зазора между соседями. Порядок
+    // деления и его направление уже решены на каждом узле заранее (см.
+    // splitting) — здесь только считается геометрия, рекурсивно сверху вниз.
     private func rects(for node: TileNode, in area: CGRect) -> [(TileNode, CGRect)] {
         switch node.content {
         case .leaf:
             return [(node, area)]
-        case .split(let vertical, let ratio, let a, let b):
-            let (rectA, rectB) = halves(area, vertical: vertical, ratio: ratio)
+        case .split(let vertical, let a, let b):
+            let (rectA, rectB) = halves(area, vertical: vertical)
             return rects(for: a, in: rectA) + rects(for: b, in: rectB)
         }
     }
 
-    // ratio — доля ПЕРВОГО куска от площади, оставшейся после вычета зазора.
-    // При ratio = 0.5 (обычное деление) формула сводится к прежнему «пополам
-    // каждому».
-    private func halves(_ area: CGRect, vertical: Bool, ratio: CGFloat) -> (CGRect, CGRect) {
+    private func halves(_ area: CGRect, vertical: Bool) -> (CGRect, CGRect) {
         if vertical {
-            let available = area.width - tileGap
-            let firstWidth = available * ratio
+            let half = (area.width - tileGap) / 2
             return (
-                CGRect(x: area.minX, y: area.minY, width: firstWidth, height: area.height),
+                CGRect(x: area.minX, y: area.minY, width: half, height: area.height),
                 CGRect(
-                    x: area.minX + firstWidth + tileGap, y: area.minY,
-                    width: available - firstWidth, height: area.height)
+                    x: area.minX + half + tileGap, y: area.minY,
+                    width: area.width - half - tileGap, height: area.height)
             )
         }
-        let available = area.height - tileGap
-        let firstHeight = available * ratio
+        let half = (area.height - tileGap) / 2
         return (
-            CGRect(x: area.minX, y: area.minY, width: area.width, height: firstHeight),
+            CGRect(x: area.minX, y: area.minY, width: area.width, height: half),
             CGRect(
-                x: area.minX, y: area.minY + firstHeight + tileGap,
-                width: area.width, height: available - firstHeight)
+                x: area.minX, y: area.minY + half + tileGap,
+                width: area.width, height: area.height - half - tileGap)
         )
     }
 
-    // Самый мелкий ЗАНЯТЫЙ лист — хвост спирали. Цель по умолчанию, когда
-    // активное окно не отслеживается, и всегда цель для окон сверх лимита
-    // ячеек: переполнение уходит в самое маленькое место независимо от того,
-    // где сейчас работает пользователь. Свободные ячейки в расчёт не идут —
-    // ими явно распоряжается insertNew, до вызова этой функции.
+    // Самый мелкий лист — хвост спирали. Цель по умолчанию, когда активное
+    // окно не отслеживается, и всегда цель для окон сверх лимита ячеек:
+    // переполнение уходит в самое маленькое место независимо от того, где
+    // сейчас работает пользователь — так же, как раньше в плоском списке.
     private func tailLeaf(_ node: TileNode, in area: CGRect) -> TileNode {
-        rects(for: node, in: area)
-            .filter {
-                if case .leaf(let ids) = $0.0.content { return !ids.isEmpty }
-                return true
-            }
-            .min { $0.1.width * $0.1.height < $1.1.width * $1.1.height }!.0
+        rects(for: node, in: area).min { $0.1.width * $0.1.height < $1.1.width * $1.1.height }!.0
     }
 
     // Удаляет окно из дерева. Если оно было единственным в своём листе, узел
@@ -1109,15 +1047,15 @@ final class Controller: NSObject, NSApplicationDelegate {
             if remaining.isEmpty { return nil }
             node.content = .leaf(remaining)
             return node
-        case .split(let vertical, let ratio, let a, let b):
+        case .split(let vertical, let a, let b):
             if findLeaf(a, containing: id) != nil {
                 guard let newA = removing(id, from: a) else { return b }
-                node.content = .split(vertical: vertical, ratio: ratio, newA, b)
+                node.content = .split(vertical: vertical, newA, b)
                 return node
             }
             if findLeaf(b, containing: id) != nil {
                 guard let newB = removing(id, from: b) else { return a }
-                node.content = .split(vertical: vertical, ratio: ratio, a, newB)
+                node.content = .split(vertical: vertical, a, newB)
                 return node
             }
             return node
@@ -1131,7 +1069,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         guard case .leaf(let existing) = target.content else { return }
         let vertical = targetRect.width >= targetRect.height
         target.content = .split(
-            vertical: vertical, ratio: 0.5, TileNode(.leaf(existing)), TileNode(.leaf([id])))
+            vertical: vertical, TileNode(.leaf(existing)), TileNode(.leaf([id])))
     }
 
     // Присоединяет окно к стопке листа без деления — когда ячеек уже
@@ -1142,22 +1080,15 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     // Добавляет новое (ранее не отслеживаемое) окно в дерево этого экрана.
-    // Свободная ячейка (см. applyShrinkSplit) заполняется в первую очередь —
-    // человек её и оставил именно для следующего окна, тут и preferredTarget
-    // спрашивать не нужно. Если свободных ячеек нет, preferredTarget — лист
-    // активного окна, если оно отслеживается здесь; nil означает «взять
-    // хвост спирали». При достижении maxTiles цель всегда хвост, независимо
-    // от preferredTarget: переполнение не может расталкивать активную
-    // ячейку, для него отведено ровно одно место.
+    // preferredTarget — лист активного окна, если оно отслеживается здесь;
+    // nil означает «взять хвост спирали». При достижении maxTiles цель
+    // всегда хвост, независимо от preferredTarget: переполнение не может
+    // расталкивать активную ячейку, для него отведено ровно одно место.
     private func insertNew(
         _ id: CGWindowID, into tree: inout TileNode?, area: CGRect, preferredTarget: TileNode?
     ) {
         guard let root = tree else {
             tree = TileNode(.leaf([id]))
-            return
-        }
-        if let empty = findEmptyLeaf(root) {
-            empty.content = .leaf([id])
             return
         }
         if leafCount(root) >= maxTiles {
@@ -1192,90 +1123,6 @@ final class Controller: NSObject, NSApplicationDelegate {
         } else {
             appending(id, to: targetLeaf)
         }
-    }
-
-    // Окно переставили в уже существующую свободную ячейку (см.
-    // applyShrinkSplit) — сама ячейка уже нужного размера, делить нечего,
-    // просто заселяем её.
-    private func moveIntoEmpty(
-        _ id: CGWindowID, target: TileNode, tree: inout TileNode?
-    ) {
-        guard let root = tree, let after = removing(id, from: root) else { return }
-        tree = after
-        guard case .leaf(let ids) = target.content, ids.isEmpty else { return }
-        target.content = .leaf([id])
-    }
-
-    // Окно ужалось (или переехало) внутри своей же ячейки, не задев никого
-    // другого, — например, было единственным на всю половину экрана,
-    // а стало занимать только её четверть. Раньше это не распознавалось
-    // вовсе: раскладке не с кем было «поменять» окно местами, ведь никто
-    // другой на освободившееся место не претендовал, — окно просто
-    // повисало там, где Raycast его поставил, а раскладка тихо оставалась
-    // при своём мнении, не подтверждая случившееся и не подхватывая его
-    // в дальнейшем. Теперь исходный лист делится на две части ровно в той
-    // пропорции, которую фактически выбрал человек: окно получает точную
-    // копию своей новой рамки, а второй кусок становится свободной ячейкой,
-    // которую можно занять следующим новым окном или следующей
-    // перестановкой (см. insertNew и mostOverlappedEmptyLeaf).
-    private func applyShrinkSplit(
-        _ id: CGWindowID, leaf: TileNode, vertical: Bool, ratio: CGFloat, windowFirst: Bool
-    ) {
-        let win = TileNode(.leaf([id]))
-        let empty = TileNode(.leaf([]))
-        leaf.content = .split(
-            vertical: vertical, ratio: windowFirst ? ratio : 1 - ratio,
-            windowFirst ? win : empty, windowFirst ? empty : win)
-    }
-
-    // Определяет, является ли newFrame «ужиманием» ownRect в одном
-    // направлении — ровно та же ширина (высота не тронута) или ровно та же
-    // высота (ширина не тронута), меньше исходной, прижато к одному из
-    // краёв. Допуск 3pt — тот же, что и везде при сравнении рамок. Если
-    // newFrame не укладывается в эту форму (например, окно улетело
-    // в произвольное место экрана, не связанное со своей прежней ячейкой),
-    // возвращает nil — угадывать тут нечего, раскладка просто не реагирует,
-    // как и раньше.
-    private func shrinkSplit(ownRect: CGRect, newFrame: CGRect) -> (
-        vertical: Bool, ratio: CGFloat, windowFirst: Bool
-    )? {
-        let sameWidth = abs(newFrame.width - ownRect.width) < 3
-        let sameHeight = abs(newFrame.height - ownRect.height) < 3
-        guard sameWidth != sameHeight else { return nil }
-
-        if sameWidth {
-            guard newFrame.height < ownRect.height - 3 else { return nil }
-            let atTop = abs(newFrame.minY - ownRect.minY) < 3
-            let atBottom = abs(newFrame.maxY - ownRect.maxY) < 3
-            guard atTop != atBottom else { return nil }
-            let ratio = newFrame.height / ownRect.height
-            return (vertical: false, ratio: ratio, windowFirst: atTop)
-        }
-        guard newFrame.width < ownRect.width - 3 else { return nil }
-        let atLeft = abs(newFrame.minX - ownRect.minX) < 3
-        let atRight = abs(newFrame.maxX - ownRect.maxX) < 3
-        guard atLeft != atRight else { return nil }
-        let ratio = newFrame.width / ownRect.width
-        return (vertical: true, ratio: ratio, windowFirst: atLeft)
-    }
-
-    // Среди свободных ячеек ищет ту, что новая рамка окна перекрывает
-    // сильнее всего, — та же логика, что mostOverlapped, только цель не
-    // окно, а уже существующее свободное место (человек занимает своим
-    // окном дыру, оставленную кем-то раньше).
-    private func mostOverlappedEmptyLeaf(_ frame: CGRect, tree: TileNode, area: CGRect) -> TileNode?
-    {
-        var best: (leaf: TileNode, ratio: CGFloat)?
-        for (leaf, rect) in rects(for: tree, in: area) {
-            guard case .leaf(let ids) = leaf.content, ids.isEmpty else { continue }
-            let overlap = frame.intersection(rect)
-            guard !overlap.isNull else { continue }
-            let smaller = min(frame.width * frame.height, rect.width * rect.height)
-            guard smaller > 0 else { continue }
-            let ratio = (overlap.width * overlap.height) / smaller
-            if ratio > 0.3, best == nil || ratio > best!.ratio { best = (leaf, ratio) }
-        }
-        return best?.leaf
     }
 
     // Применяет дерево к реальным окнам: считает прямоугольники листьев
