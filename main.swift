@@ -22,12 +22,14 @@
 //
 // Отдельно: новое открытое окно само встраивается в раскладку рядом с уже
 // открытыми на том же экране — по схеме dwindle, как в Hyprland по
-// умолчанию. Первое окно на весь экран, каждое следующее делит пополам
-// ячейку последнего добавленного, направление деления — по пропорциям этой
-// ячейки. Получается спираль: одно большое окно и всё мельче остальные.
-// Ячеек не больше пяти: шестое и последующие окна складываются стопкой
-// в последнюю ячейку, сверху — самое новое, до остальных можно добраться
-// перебором Option+Tab.
+// умолчанию. Первое окно на весь экран. Каждое следующее встаёт сразу после
+// активного окна в списке порядка — по факту это чаще всего означает
+// «справа» или «снизу» от него, — а не обязательно после последнего
+// добавленного; направление деления той ячейки, куда оно попало, выбирается
+// по её пропорциям. Получается спираль: одно большое окно и всё мельче
+// остальные. Ячеек не больше пяти: шестое и последующие окна складываются
+// стопкой в последнюю ячейку, сверху — самое новое, до остальных можно
+// добраться перебором Option+Tab.
 // Между окнами и по краю экрана — зазор 8pt, такой же, как у Raycast Window
 // Management. Раскладку не получают окна в настоящем системном
 // полноэкранном режиме (тот же признак и в переборе) и окна, которым нельзя
@@ -41,6 +43,11 @@
 // освободившееся место; вернули обычный размер — окно само возвращается.
 // Переставили окно клавишами в четверть/половину, где уже стояло другое
 // отслеживаемое окно, — раскладка меняет их местами и раздвигает заново.
+//
+// Пока растянутое окно висит поверх остальных, перебор Option+Tab с него —
+// не на само растянутое окно — поднимает СРАЗУ все окна из плиток этого
+// экрана, а не по одному; само растянутое окно при этом не трогается,
+// вернуть его в раскладку можно только вручную, клавишами.
 //
 // Сочетания:
 //   Option + Tab         — следующее окно по часовой стрелке
@@ -176,6 +183,13 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// Raycast) — временно выведены из раскладки, отдельно на каждый экран.
     /// Возвращаются обратно, как только перестают быть почти во весь экран.
     private var floated: [CGDirectDisplayID: Set<CGWindowID>] = [:]
+    /// Переднее окно на конец ПРОШЛОГО такта — то, что было активно до
+    /// появления нового окна. К моменту, когда опрос вообще замечает новое
+    /// окно, оно почти всегда уже само стало передним (открытие документа
+    /// само крадёт фокус) — свежий front на этом такте показал бы само новое
+    /// окно, а не то, где человек работал секунду назад. Используется только
+    /// для выбора места нового окна в списке, не для затемнения.
+    private var lastObservedFrontID: CGWindowID?
     /// Окна с фиксированным размером, которые раскладка уже поставила по
     /// центру. Повторно не трогаем: пользователь мог отодвинуть окно сам.
     private var centered: Set<CGWindowID> = []
@@ -279,9 +293,11 @@ final class Controller: NSObject, NSApplicationDelegate {
             // с Accessibility делалась дважды за каждый такт.
             let list = self.windowList()
             let current = self.collectWindows(from: list)
+            let previousFront = self.lastObservedFrontID
             self.updateDimming(list: list, windows: current, force: false)
-            self.checkForNewWindows(current: current)
+            self.checkForNewWindows(current: current, frontID: previousFront)
             self.watchManualResize(current: current)
+            if let front = self.frontWindowID(in: list) { self.lastObservedFrontID = front }
         }
         RunLoop.main.add(timer, forMode: .common)
         dimTimer = timer
@@ -455,7 +471,42 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
         guard snapshot.count > 1 else { return }
         index = (index + (forward ? 1 : -1) + snapshot.count) % snapshot.count
-        focus(snapshot[index])
+        let win = snapshot[index]
+        if !revealTilesIfCyclingAway(to: win) {
+            focus(win)
+        }
+    }
+
+    // Переключились перебором на окно, которое НЕ то, что вручную растянули
+    // почти на весь экран (isNearFullScreenArea) — раскладка про растянутое
+    // временно забыла (floated), но геометрию его не трогает, оно так
+    // и остаётся во весь экран, просто уже под остальными по слоям.
+    // Остальные окна на этом экране, пока растянутое было на переднем крае,
+    // всё равно были правильно разложены между собой на всю освободившуюся
+    // площадь — просто не видны, растянутое их закрывало. Обычный focus()
+    // поднимает поверх только ОДНО окно — цель переключения — и оно
+    // появлялось бы по одному краю растянутого, а не всей плиткой сразу.
+    // Здесь вместо этого поднимаем СРАЗУ все окна из плиток этого экрана —
+    // друг друга они не перекрывают, порядок между ними не важен, — а само
+    // растянутое окно не трогаем вовсе: ни размер, ни место в раскладке.
+    // Хотите вернуть его в плитки — верните сами, клавишами, как обычно.
+    //
+    // Возвращает true, если применилось (тогда step() не вызывает обычный
+    // focus() отдельно — targetWindow здесь уже сделан главным и передним).
+    private func revealTilesIfCyclingAway(to win: WinRef) -> Bool {
+        guard let screen = screenContaining(win.center), let did = screenID(screen),
+            let floatedHere = floated[did], !floatedHere.isEmpty,
+            !floatedHere.contains(win.windowID)
+        else { return false }
+
+        let current = collectWindows(from: windowList())
+        let byID = Dictionary(uniqueKeysWithValues: current.map { ($0.windowID, $0) })
+        for id in tileOrder[did] ?? [] where id != win.windowID {
+            guard let other = byID[id] else { continue }
+            AXUIElementPerformAction(other.element, kAXRaiseAction as CFString)
+        }
+        focus(win)
+        return true
     }
 
     private func focus(_ win: WinRef) {
@@ -512,7 +563,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     // единственным, и окно, которое приложение просто восстановило из
     // прошлой сессии в старой большой рамке.
 
-    private func checkForNewWindows(current: [WinRef]) {
+    private func checkForNewWindows(current: [WinRef], frontID: CGWindowID?) {
         guard tilingEnabled, !cycling else { return }
 
         let currentIDs = Set(current.map(\.windowID))
@@ -629,10 +680,18 @@ final class Controller: NSObject, NSApplicationDelegate {
 
             let floatedHere = floated[id] ?? []
             var order = (tileOrder[id] ?? []).filter { byID[$0] != nil }
+            // Новое окно встаёт сразу за активным — по факту это чаще всего
+            // означает «справа» или «снизу», в зависимости от того, как
+            // делится ячейка активного окна в спирали. Если активное окно
+            // не отслеживается здесь (на другом экране, или это вообще не
+            // обычное окно) — как и раньше, в конец списка, в хвост спирали.
+            let insertAt = frontID.flatMap { order.firstIndex(of: $0) }.map { $0 + 1 } ?? order.count
+            var offset = 0
             for win in onScreen where !order.contains(win.windowID) {
                 if win.isFullScreenNow || floatedHere.contains(win.windowID) { continue }
                 if !win.isResizable { continue }
-                order.append(win.windowID)
+                order.insert(win.windowID, at: min(insertAt + offset, order.count))
+                offset += 1
             }
             tileOrder[id] = order
 
