@@ -501,23 +501,27 @@ final class Controller: NSObject, NSApplicationDelegate {
     // сам, пока мы не смотрели (пользователь через Raycast, само приложение
     // и так далее). Дальше два разных случая:
     //
-    //   а) новая рамка совпадает с тем местом, где раскладка держала ДРУГОЕ
-    //      отслеживаемое окно, — это перестановка. Raycast и подобные
-    //      команды не знают о тайлинге и просто переставляют окно в нужную
-    //      четверть/половину экрана, не двигая то, что там уже было, —
-    //      физически они накладываются друг на друга. Не меняем два окна
-    //      местами один на один — переставленное окно вынимается из своего
-    //      старого места в порядке и вставляется перед тем окном, чью рамку
-    //      заняло. Дальше пересчитываем: всё, что было после точки вставки,
-    //      сдвигается по спирали на шаг — как при обычном открытии нового
-    //      окна, а не изолированный обмен между только этими двумя.
-    //
-    //   б) окно стало занимать почти весь экран — намеренный разворот,
+    //   а) окно стало занимать почти весь экран — намеренный разворот,
     //      раскладке лезть туда не нужно: окно выводится из неё («floated»),
     //      освободившееся место сразу отдаётся остальным окнам на экране.
     //
-    // И наоборот: окно, выведенное так из раскладки, продолжаем проверять —
-    // как только оно перестаёт быть почти во весь экран (пользователь сам
+    //   б) иначе — окно переставили в другое место вручную, например
+    //      клавишами в четверть экрана. Raycast и подобные команды не знают
+    //      о тайлинге и просто переставляют окно в нужную область, не
+    //      двигая то, что там уже было, — физически они накладываются друг
+    //      на друга. Точного совпадения координат тут не бывает: свои
+    //      четверти Raycast считает независимо от нашей раскладки, и даже
+    //      если визуально это одно и то же место, пиксель в пиксель они не
+    //      совпадут (для половин экрана иногда совпадает случайно, для
+    //      четвертей — почти никогда). Поэтому ищем не точное совпадение
+    //      рамки, а окно, которое новая рамка перекрывает больше всего, —
+    //      оно и было «на этом месте». Переставленное окно вынимается из
+    //      своего места в порядке и вставляется перед найденным — всё, что
+    //      было после точки вставки, сдвигается по спирали на шаг, как при
+    //      обычном открытии нового окна, а не изолированный обмен вдвоём.
+    //
+    // И наоборот: окно, выведенное как «почти весь экран», продолжаем
+    // проверять — как только оно перестаёт быть таким (пользователь сам
     // вернул ему обычный размер), оно тут же возвращается в раскладку.
     private func watchManualResize(current: [WinRef]) {
         guard tilingEnabled, !cycling else { return }
@@ -537,20 +541,18 @@ final class Controller: NSObject, NSApplicationDelegate {
                     !close(win.frame, expected)
                 else { continue }
 
-                if let targetID = order.first(where: { other in
-                    other != id
-                        && lastAppliedFrame[other].map { close(win.frame, $0) } == true
-                }) {
+                if isNearFullScreenArea(win.frame, on: screen) {
                     order.removeAll { $0 == id }
-                    let insertAt = order.firstIndex(of: targetID) ?? order.count
-                    order.insert(id, at: insertAt)
+                    floatSet.insert(id)
                     changed = true
                     continue
                 }
 
-                if isNearFullScreenArea(win.frame, on: screen) {
+                if let targetID = mostOverlapped(win.frame, among: order, excluding: id, byID: byID)
+                {
                     order.removeAll { $0 == id }
-                    floatSet.insert(id)
+                    let insertAt = order.firstIndex(of: targetID) ?? order.count
+                    order.insert(id, at: insertAt)
                     changed = true
                 }
             }
@@ -585,6 +587,38 @@ final class Controller: NSObject, NSApplicationDelegate {
         let visibleArea = screen.visibleFrame.width * screen.visibleFrame.height
         guard visibleArea > 0 else { return false }
         return (frame.width * frame.height) / visibleArea > 0.85
+    }
+
+    // Среди отслеживаемых окон ищет то, чьё МЕСТО (не текущее положение —
+    // именно рамка, которую туда в последний раз поставила сама раскладка)
+    // новая рамка перекрывает сильнее всего. Это важно, если пользователь
+    // переставил сразу два окна почти одновременно — если бы сравнивали
+    // с текущим положением соседа, а не с его законным местом, оба окна
+    // к моменту проверки уже съехали бы каждое со своего места, и они
+    // просто не нашли бы друг друга. Доля считается от МЕНЬШЕЙ из двух
+    // площадей, чтобы маленькое окно, вставшее внутрь большого, тоже
+    // засчиталось, а не потерялось в знаменателе. Порог 30% — с запасом
+    // ниже почти любой реальной перестановки (два окна, поставленные в одно
+    // и то же место разными раскладками, обычно перекрываются почти
+    // полностью) и заметно выше случайного касания краями соседних ячеек
+    // спирали.
+    private func mostOverlapped(
+        _ frame: CGRect, among order: [CGWindowID], excluding: CGWindowID,
+        byID: [CGWindowID: WinRef]
+    ) -> CGWindowID? {
+        var best: (id: CGWindowID, ratio: CGFloat)?
+        for other in order where other != excluding {
+            guard byID[other] != nil, let otherSlot = lastAppliedFrame[other] else { continue }
+            let overlap = frame.intersection(otherSlot)
+            guard !overlap.isNull else { continue }
+            let smaller = min(frame.width * frame.height, otherSlot.width * otherSlot.height)
+            guard smaller > 0 else { continue }
+            let ratio = (overlap.width * overlap.height) / smaller
+            if ratio > 0.3, best == nil || ratio > best!.ratio {
+                best = (other, ratio)
+            }
+        }
+        return best?.id
     }
 
     // NSScreen работает в кокоавских координатах (низ слева, экраны как
