@@ -20,16 +20,19 @@
 //
 // Свёрнутые окна пропускаются.
 //
-// Отдельно: новое открытое окно само встраивается в раскладку рядом с уже
-// открытыми на том же экране — по схеме dwindle, как в Hyprland по
-// умолчанию. Первое окно на весь экран. Каждое следующее встаёт сразу после
-// активного окна в списке порядка — по факту это чаще всего означает
-// «справа» или «снизу» от него, — а не обязательно после последнего
-// добавленного; направление деления той ячейки, куда оно попало, выбирается
-// по её пропорциям. Получается спираль: одно большое окно и всё мельче
-// остальные. Ячеек не больше пяти: шестое и последующие окна складываются
-// стопкой в последнюю ячейку, сверху — самое новое, до остальных можно
-// добраться перебором Option+Tab.
+// Отдельно: новое открытое окно само встраивается в раскладку на том же
+// экране, по фиксированной сетке до восьми ячеек. Первое окно — весь экран.
+// Второе делит его пополам, новое встаёт справа. Третье делит правую
+// половину на верхнюю и нижнюю четверти. Четвёртое — то же слева. Дальше,
+// по часовой стрелке начиная с верхней правой четверти, каждая следующая
+// четверть делится пополам ещё раз: пятое окно — верхняя правая, шестое —
+// нижняя правая, седьмое — нижняя левая, восьмое — верхняя левая. Порядок
+// деления — chronological: какое окно открыто раньше, та ячейка (или её
+// половина в существующей ещё не разделённой четверти) ему и принадлежит,
+// вне зависимости от того, какое окно было активно в момент открытия.
+// Девятое и последующие окна в сетку уже не попадают — вместо тесной
+// девятой дольки такое окно сразу растягивается на весь экран, тем же
+// движением, что и ручное растягивание (см. ниже), и ведёт себя так же.
 // Между окнами и по краю экрана — зазор 8pt, такой же, как у Raycast Window
 // Management. Раскладку не получают окна в настоящем системном
 // полноэкранном режиме (тот же признак и в переборе) и окна, которым нельзя
@@ -94,10 +97,10 @@ private let dimSteps = [15, 25, 35, 45, 55, 70]
 // область показывает выигрыш в отступе именно 8pt со всех сторон).
 private let tileGap: CGFloat = 8
 
-// Сколько ячеек раскладка делает максимум. Дальше делить бессмысленно:
-// на экране ноутбука шестая ячейка уже уже трёхсот точек, читать в ней
-// нечего. Всё, что сверх, уходит стопкой в последнюю ячейку.
-private let maxTiles = 5
+// Сколько ячеек раскладка делает максимум — фиксированная сетка из
+// gridRects дальше восьми не делит. Девятое и последующие окна в сетку
+// не попадают вовсе, см. stretchBeyondCapacity.
+private let maxGridTiles = 8
 
 // Сколько ждать, пока программа применит поставленную ей рамку, прежде чем
 // считать расхождение ручным вмешательством.
@@ -162,6 +165,14 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var snapshot: [WinRef] = []
     private var index = 0
     private var cycling = false
+    /// Плитки, уже показанные в текущем туре перебора — переживает и
+    /// отдельные нажатия Tab с отпусканием Option между ними, не только
+    /// удержание. Не даёт кругу «срезать» к растянутым окнам раньше, чем
+    /// показаны все плитки хотя бы по разу — см. step().
+    private var visitedTiles: Set<CGWindowID> = []
+    /// Окно, с которого начался текущий тур по плиткам, — после растянутых
+    /// круг возвращается именно сюда, а не на первую плитку по углу.
+    private var tourStart: CGWindowID?
 
     private var overlays: [Overlay] = []
     private var dimTimer: Timer?
@@ -186,13 +197,6 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// Raycast) — временно выведены из раскладки, отдельно на каждый экран.
     /// Возвращаются обратно, как только перестают быть почти во весь экран.
     private var floated: [CGDirectDisplayID: Set<CGWindowID>] = [:]
-    /// Переднее окно на конец ПРОШЛОГО такта — то, что было активно до
-    /// появления нового окна. К моменту, когда опрос вообще замечает новое
-    /// окно, оно почти всегда уже само стало передним (открытие документа
-    /// само крадёт фокус) — свежий front на этом такте показал бы само новое
-    /// окно, а не то, где человек работал секунду назад. Используется только
-    /// для выбора места нового окна в списке, не для затемнения.
-    private var lastObservedFrontID: CGWindowID?
     /// Окна с фиксированным размером, которые раскладка уже поставила по
     /// центру. Повторно не трогаем: пользователь мог отодвинуть окно сам.
     private var centered: Set<CGWindowID> = []
@@ -296,11 +300,9 @@ final class Controller: NSObject, NSApplicationDelegate {
             // с Accessibility делалась дважды за каждый такт.
             let list = self.windowList()
             let current = self.collectWindows(from: list)
-            let previousFront = self.lastObservedFrontID
             self.updateDimming(list: list, windows: current, force: false)
-            self.checkForNewWindows(current: current, frontID: previousFront)
+            self.checkForNewWindows(current: current)
             self.watchManualResize(current: current)
-            if let front = self.frontWindowID(in: list) { self.lastObservedFrontID = front }
         }
         RunLoop.main.add(timer, forMode: .common)
         dimTimer = timer
@@ -473,9 +475,80 @@ final class Controller: NSObject, NSApplicationDelegate {
             index = snapshot.firstIndex { $0.depth == frontDepth } ?? 0
         }
         guard snapshot.count > 1 else { return }
-        index = (index + (forward ? 1 : -1) + snapshot.count) % snapshot.count
+
+        // Растянутые окна дописаны в конец кругового списка одним куском
+        // (см. orderedWindows) — у списка есть фиксированный «шов» между
+        // последней плиткой по углу и первым растянутым окном. Если текущее
+        // активное окно как раз и стоит в этом шве (последнее по углу среди
+        // плиток — вполне обычная ситуация, ничего особенного в его
+        // положении на экране может и не быть), одно нажатие «вперёд»
+        // сразу упирается в растянутое, хотя другие плитки ещё не
+        // показывались. Обходим это явно: держим, какие плитки уже видели
+        // в этом туре (переживает и отдельные нажатия с отпусканием Option,
+        // не только удержание — заново набор сбрасывается, если изменился
+        // состав окон), и не пускаем к растянутым, пока не показали все
+        // плитки хотя бы по разу. Место, откуда тур начался (tourStart),
+        // запоминаем отдельно: после растянутых круг должен вернуться
+        // именно туда, а не на первую плитку по углу, какая бы она ни была.
+        // Запоминаем ДО шага: раскладывать заново все плитки поверх
+        // растянутого нужно только в момент, когда мы С НЕГО уходим — а не
+        // при каждом шаге между уже показанными плитками. Иначе на каждое
+        // обычное переключение (плитка → плитка) уходило то же самое
+        // «поднять всех и подождать», хотя поднимать было некого — они и так
+        // уже были на виду. Отсюда и лишнее мелькание: чужое окно на
+        // мгновение мелькало поверх, прежде чем осесть на нужном.
+        let wasOnFloated = isFloated(snapshot[index])
+
+        let tileIDs = Set(snapshot.filter { !isFloated($0) }.map(\.windowID))
+        if !visitedTiles.isSubset(of: tileIDs) {
+            visitedTiles = []
+            tourStart = nil
+        }
+        if !isFloated(snapshot[index]) {
+            let id = snapshot[index].windowID
+            // Тур начинается заново либо с нуля, либо когда круг уже вернулся
+            // туда, откуда начинал, — иначе tourStart и «уже видели» остаются
+            // от прошлого прохода, и второй лишний раз ничего не покажет.
+            if visitedTiles.isEmpty || (id == tourStart && visitedTiles.count >= tileIDs.count) {
+                tourStart = id
+                visitedTiles = []
+            }
+            visitedTiles.insert(id)
+        }
+
+        var next = index
+        if isFloated(snapshot[index]) {
+            // С растянутого окна: пока следующее по кругу тоже растянутое —
+            // идём по ним как обычно; как только упёрлись бы в плитку —
+            // это не «какая попало», а именно та, откуда начинался тур.
+            let candidate = (index + (forward ? 1 : -1) + snapshot.count) % snapshot.count
+            if isFloated(snapshot[candidate]) {
+                next = candidate
+            } else if let start = tourStart,
+                let startIndex = snapshot.firstIndex(where: { $0.windowID == start })
+            {
+                next = startIndex
+            } else {
+                next = candidate
+            }
+        } else {
+            for _ in 0..<snapshot.count {
+                next = (next + (forward ? 1 : -1) + snapshot.count) % snapshot.count
+                let candidate = snapshot[next]
+                if isFloated(candidate) {
+                    if visitedTiles.count >= tileIDs.count { break }  // тур завершён, растянутые доступны
+                } else if !visitedTiles.contains(candidate.windowID) {
+                    break  // новая, ещё не показанная в этом туре плитка
+                }
+            }
+        }
+        index = next
         let win = snapshot[index]
-        if !revealTilesIfCyclingAway(to: win) {
+        if !isFloated(win) { visitedTiles.insert(win.windowID) }
+
+        if wasOnFloated, !isFloated(win), revealTilesIfCyclingAway(to: win) {
+            // применилось — обычный focus() уже не нужен, он сделан внутри
+        } else {
             focus(win)
         }
     }
@@ -522,6 +595,10 @@ final class Controller: NSObject, NSApplicationDelegate {
             NSRunningApplication(processIdentifier: other.pid)?.activate(options: [])
             Thread.sleep(forTimeInterval: 0.03)
         }
+        // Той же паузы не хватает и на стыке с финальным focus(win) — окно-
+        // цель не всегда реально становится передним, если его собственная
+        // активация идёт вплотную за последней активацией из цикла выше.
+        Thread.sleep(forTimeInterval: 0.03)
         focus(win)
         return true
     }
@@ -538,15 +615,18 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: dwindle-тайлинг новых окон
+    // MARK: тайлинг новых окон — фиксированная сетка
+
     //
-    // Раскладка как в Hyprland по умолчанию (dwindle): первое окно занимает
-    // весь экран. Каждое следующее делит пополам ячейку, где сейчас сидит
-    // САМОЕ ПОСЛЕДНЕЕ добавленное окно — старые окна, кроме этого последнего,
-    // свои места не меняют. Направление деления выбирается по пропорциям
-    // самой ячейки: широкая делится вертикальной линией (получаются левая
-    // и правая половины), высокая — горизонтальной (верх и низ). Из-за этого
-    // получается спираль: одно большое окно и всё более мелкие рядом с ним.
+    // Раскладка — не рекурсивная спираль, а фиксированная сетка до восьми
+    // ячеек (см. gridRects). Какую ячейку получает окно, определяется только
+    // тем, каким по счёту оно открылось на этом экране, — а не тем, какое
+    // окно было активно в момент открытия. Первое окно — весь экран, второе
+    // делит его пополам (новое справа), третье и четвёртое делят пополам уже
+    // существующие половины (сначала правую, потом левую — так получаются
+    // четыре четверти), а пятое—восьмое делят по одной из этих четвертей
+    // пополам ещё раз, по часовой стрелке начиная с верхней правой. Девятое
+    // и далее в сетку уже не попадают — см. stretchBeyondCapacity.
     //
     // Тот же опрос раз в треть секунды, что двигает подложку затемнения,
     // заодно следит за появлением новых окон: если открылось окно, которого
@@ -555,16 +635,18 @@ final class Controller: NSObject, NSApplicationDelegate {
     // пересчитывается по новому списку.
     //
     // Порядок нужно где-то хранить между тактами опроса — иначе непонятно,
-    // какое окно «последнее» и чью ячейку делить дальше. Закрытие окна
-    // (или его сворачивание, или Command+H — с точки зрения раскладки это
-    // всё «пропало из отслеживаемых») точно так же пересчитывает раскладку
-    // на его экране, освобождённое место сразу отдаётся соседям.
+    // какое окно каким по счёту открылось и какую ячейку ему по сетке
+    // отвести. Закрытие окна (или его сворачивание, или Command+H — с точки
+    // зрения раскладки это всё «пропало из отслеживаемых») точно так же
+    // пересчитывает раскладку на его экране заново, по сетке для уже
+    // уменьшившегося числа окон, — освобождённое место сразу отдаётся
+    // соседям.
     //
     // Набор окон для тайлинга — ВСЕ подходящие окна, включая те, что сейчас
     // занимают почти весь экран. Это важно: если исключать такие окна отсюда
     // так же, как исключаем их из перебора, раскладка ломала бы сама себя —
-    // единственное окно на экране dwindle сам растягивает на весь экран (это
-    // и есть правильное поведение при n=1), а на следующем такте это же
+    // единственное окно на экране раскладка сама растягивает на весь экран
+    // (это и есть правильное поведение при n=1), а на следующем такте это же
     // окно перестало бы считаться «подходящим» и выпало бы из отслеживания.
     // Дальше уже ничего не с чем сравнивать: следующее открытое окно видит
     // пустой список, тайлинг не срабатывает вообще — ровно то, что и
@@ -580,7 +662,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     // единственным, и окно, которое приложение просто восстановило из
     // прошлой сессии в старой большой рамке.
 
-    private func checkForNewWindows(current: [WinRef], frontID: CGWindowID?) {
+    private func checkForNewWindows(current: [WinRef]) {
         guard tilingEnabled, !cycling else { return }
 
         let currentIDs = Set(current.map(\.windowID))
@@ -625,13 +707,16 @@ final class Controller: NSObject, NSApplicationDelegate {
                 byScreen[did, default: []].append(win)
             }
             for (did, wins) in byScreen {
-                // Порядок восстанавливаем по геометрии, а не по слоям. В
-                // спирали каждая следующая ячейка не больше предыдущей, так
-                // что «от большего к меньшему» воспроизводит исходный порядок
-                // раскладки, если она на экране уже была (а после каждой
-                // пересборки она именно там и есть). Равные по площади —
-                // последняя пара ячеек и окна одной стопки; их разводим по
-                // положению, сверху вниз и слева направо.
+                // Порядок восстанавливаем по геометрии, а не по слоям —
+                // приблизительно, «от большего к меньшему»: в сетке ячейки
+                // открытых раньше окон в среднем не меньше ячеек открытых
+                // позже (хотя при полной сетке несколько ячеек равны между
+                // собой). Точного восстановления это не гарантирует, зато
+                // не требует; следующее же открытие или закрытие окна
+                // пересчитает раскладку заново, уже с реальным порядком.
+                // Равные по площади ячейки (сама сетка или одинаково
+                // растянутые floated-окна) разводим по положению, сверху
+                // вниз и слева направо.
                 //
                 // Брать порядок из системного списка окон нельзя: он идёт по
                 // слоям и меняется от любого переключения. Записанный так
@@ -695,22 +780,31 @@ final class Controller: NSObject, NSApplicationDelegate {
             let onScreen = current.filter { screenContaining($0.center) === screen }
             let byID = Dictionary(uniqueKeysWithValues: onScreen.map { ($0.windowID, $0) })
 
-            let floatedHere = floated[id] ?? []
             var order = (tileOrder[id] ?? []).filter { byID[$0] != nil }
-            // Новое окно встаёт сразу за активным — по факту это чаще всего
-            // означает «справа» или «снизу», в зависимости от того, как
-            // делится ячейка активного окна в спирали. Если активное окно
-            // не отслеживается здесь (на другом экране, или это вообще не
-            // обычное окно) — как и раньше, в конец списка, в хвост спирали.
-            let insertAt = frontID.flatMap { order.firstIndex(of: $0) }.map { $0 + 1 } ?? order.count
-            var offset = 0
-            for win in onScreen where !order.contains(win.windowID) {
-                if win.isFullScreenNow || floatedHere.contains(win.windowID) { continue }
-                if !win.isResizable { continue }
-                order.insert(win.windowID, at: min(insertAt + offset, order.count))
-                offset += 1
+            var floatSet = (floated[id] ?? []).filter { byID[$0] != nil }
+
+            // Новые окна встают в конец списка — сетка (gridRects) сама
+            // решает, какая ячейка кому достанется, по тому, каким по счёту
+            // окно открыто на этом экране, а не по тому, какое окно было
+            // активно в момент открытия.
+            for win in onScreen
+            where !order.contains(win.windowID) && !floatSet.contains(win.windowID) {
+                if win.isFullScreenNow || !win.isResizable { continue }
+                if order.count < maxGridTiles {
+                    order.append(win.windowID)
+                } else {
+                    // Девятое и далее окно в сетку уже не помещается —
+                    // вместо тесной дополнительной дольки сразу растягиваем
+                    // его на весь экран, тем же движением, что и ручное
+                    // растягивание, и сразу относим к floated: дальше о нём
+                    // заботится watchManualResize, как о любом другом
+                    // растянутом окне.
+                    stretchBeyondCapacity(win, on: screen)
+                    floatSet.insert(win.windowID)
+                }
             }
             tileOrder[id] = order
+            floated[id] = floatSet
 
             let ordered = order.compactMap { byID[$0] }
             guard !ordered.isEmpty else { continue }
@@ -899,44 +993,69 @@ final class Controller: NSObject, NSApplicationDelegate {
             .uint32Value
     }
 
-    // Разбивает область на n прямоугольников по правилу dwindle: каждый
-    // следующий делит пополам то, что осталось после предыдущего, — кроме
-    // самого последнего, который забирает весь оставшийся остаток целиком.
-    // Зазор встроен прямо в место деления: между двумя кусками, полученными
-    // из одного разреза, остаётся ровно tileGap — не важно, на каком уровне
-    // спирали это произошло. Отступ от края экрана даёт не эта функция,
-    // а урезанная область, которую ей передают (см. tileWindows).
-    private func dwindleRects(count n: Int, in area: CGRect) -> [CGRect] {
-        guard n > 0 else { return [] }
-        var rects: [CGRect] = []
-        var remaining = area
+    // Делит прямоугольник на левую и правую половины, с зазором tileGap
+    // между ними.
+    private func splitVertical(_ r: CGRect) -> (CGRect, CGRect) {
+        let half = (r.width - tileGap) / 2
+        let left = CGRect(x: r.minX, y: r.minY, width: half, height: r.height)
+        let right = CGRect(
+            x: r.minX + half + tileGap, y: r.minY, width: r.width - half - tileGap,
+            height: r.height)
+        return (left, right)
+    }
 
-        for i in 0..<n {
-            if i == n - 1 {
-                rects.append(remaining)
-                break
-            }
-            if remaining.width >= remaining.height {
-                let half = (remaining.width - tileGap) / 2
-                rects.append(
-                    CGRect(
-                        x: remaining.minX, y: remaining.minY, width: half,
-                        height: remaining.height))
-                remaining = CGRect(
-                    x: remaining.minX + half + tileGap, y: remaining.minY,
-                    width: remaining.width - half - tileGap, height: remaining.height)
-            } else {
-                let half = (remaining.height - tileGap) / 2
-                rects.append(
-                    CGRect(
-                        x: remaining.minX, y: remaining.minY, width: remaining.width,
-                        height: half))
-                remaining = CGRect(
-                    x: remaining.minX, y: remaining.minY + half + tileGap,
-                    width: remaining.width, height: remaining.height - half - tileGap)
-            }
-        }
-        return rects
+    // Делит прямоугольник на верхнюю и нижнюю половины, с зазором tileGap
+    // между ними.
+    private func splitHorizontal(_ r: CGRect) -> (CGRect, CGRect) {
+        let half = (r.height - tileGap) / 2
+        let top = CGRect(x: r.minX, y: r.minY, width: r.width, height: half)
+        let bottom = CGRect(
+            x: r.minX, y: r.minY + half + tileGap, width: r.width,
+            height: r.height - half - tileGap)
+        return (top, bottom)
+    }
+
+    // Раскладка не рекурсивная спираль, а фиксированная сетка до восьми
+    // ячеек, описанная целиком здесь, а не выводимая по общему правилу —
+    // самих правил всего семь (по одному на каждое n от 2 до 8), проще
+    // выписать их прямо, чем городить общий алгоритм ради него одного.
+    //
+    // Результат — n прямоугольников В ПОРЯДКЕ ОТКРЫТИЯ ОКОН: rects[0] —
+    // ячейка первого открытого на этом экране окна, rects[1] — второго,
+    // и так далее. Экран делится пополам (окно 2 — справа), затем правая
+    // половина делится на верхнюю и нижнюю четверти (окно 3 — снизу), затем
+    // то же самое с левой половиной (окно 4 — снизу). Дальше, по часовой
+    // стрелке начиная с верхней правой четверти, каждая следующая четверть
+    // делится пополам ещё раз: пятое окно донимает верхнюю правую, шестое —
+    // нижнюю правую, седьмое — нижнюю левую, восьмое — верхнюю левую.
+    // В каждом делении окно, которое уже стояло в делящейся ячейке, остаётся
+    // в первой (левой либо верхней) её половине, а новое окно — во второй
+    // (правой либо нижней): ровно то же правило, что и у самого первого
+    // деления экрана пополам.
+    private func gridRects(count n: Int, in area: CGRect) -> [CGRect] {
+        guard n > 0 else { return [] }
+        if n == 1 { return [area] }
+
+        let (l, r) = splitVertical(area)
+        if n == 2 { return [l, r] }
+
+        let (rt, rb) = splitHorizontal(r)
+        if n == 3 { return [l, rt, rb] }
+
+        let (lt, lb) = splitHorizontal(l)
+        if n == 4 { return [lt, rt, rb, lb] }
+
+        let (rt1, rt2) = splitVertical(rt)
+        if n == 5 { return [lt, rt1, rb, lb, rt2] }
+
+        let (rb1, rb2) = splitVertical(rb)
+        if n == 6 { return [lt, rt1, rb1, lb, rt2, rb2] }
+
+        let (lb1, lb2) = splitVertical(lb)
+        if n == 7 { return [lt, rt1, rb1, lb1, rt2, rb2, lb2] }
+
+        let (lt1, lt2) = splitVertical(lt)
+        return [lt1, rt1, rb1, lb1, rt2, rb2, lb2, lt2]
     }
 
     // windows должен быть в порядке добавления: windows[0] — самое старое
@@ -960,20 +1079,16 @@ final class Controller: NSObject, NSApplicationDelegate {
         log("по центру поверх остальных (размер фиксированный): \(win.owner)")
     }
 
-    // Ячеек в раскладке не больше maxTiles: дальше делить нечего, окна
-    // становятся нечитаемыми. Всё, что сверх, складывается стопкой в
-    // последнюю (самую маленькую) ячейку — видно верхнее окно стопки,
-    // остальные под ним. Ничего не пропадает: перебор Option+Tab и так
-    // ходит по всем окнам, а не только по видимым, так что до спрятанного
-    // окна можно добраться без нового сочетания клавиш. Поднятое окно
-    // перекроет соседей по стопке само, по обычным правилам системы.
+    // windows должен быть в порядке открытия: windows[0] — самое старое окно
+    // на этом экране. Ячеек больше maxGridTiles здесь не бывает — девятое
+    // и последующие окна в order вообще не попадают, см. checkForNewWindows.
     private func tileWindows(_ windows: [WinRef], on screen: NSScreen) {
         let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
-        let rects = dwindleRects(count: min(windows.count, maxTiles), in: area)
-        guard !rects.isEmpty else { return }
+        let rects = gridRects(count: windows.count, in: area)
+        guard rects.count == windows.count else { return }
 
         for (i, win) in windows.enumerated() {
-            let rect = rects[min(i, rects.count - 1)]
+            let rect = rects[i]
             var pos = rect.origin
             var size = rect.size
             let posVal = AXValueCreate(.cgPoint, &pos)!
@@ -984,21 +1099,24 @@ final class Controller: NSObject, NSApplicationDelegate {
             appliedAt[win.windowID] = Date()
         }
 
-        // Сверху стопки — то её окно, которое и так впереди остальных по
-        // системному z-порядку. Для только что открытого окна это оно само
-        // (новое окно система кладёт наверх), а для окна, выбранного
-        // перебором, — тоже оно: перебор его поднял. Раньше наверх
-        // безусловно поднималось последнее окно по порядку раскладки, и
-        // любой следующий пересчёт стирал выбор пользователя — только что
-        // найденное перебором окно снова уезжало под стопку.
-        let stacked = windows.count - maxTiles + 1
-        if stacked > 1, let top = windows.suffix(stacked).min(by: { $0.depth < $1.depth }) {
-            AXUIElementPerformAction(top.element, kAXRaiseAction as CFString)
-        }
-        log(
-            "dwindle: \(windows.count) окон"
-                + (stacked > 1 ? " (в стопке: \(stacked))" : "") + " — "
-                + windows.map(\.owner).joined(separator: ", "))
+        log("сетка: \(windows.count) окон — " + windows.map(\.owner).joined(separator: ", "))
+    }
+
+    // Девятое и последующие окна в сетку уже не помещаются (gridRects делит
+    // не больше чем на maxGridTiles). Вместо тесной дополнительной дольки
+    // такое окно сразу растягивается на весь экран — тем же самым действием,
+    // которым раньше пользователь растягивал окно вручную (например, через
+    // Raycast), — а вызывающий код сам относит его к floated: дальше о нём
+    // заботится watchManualResize, как о любом другом растянутом окне.
+    private func stretchBeyondCapacity(_ win: WinRef, on screen: NSScreen) {
+        let area = axRect(for: screen.visibleFrame).insetBy(dx: tileGap, dy: tileGap)
+        var pos = area.origin
+        var size = area.size
+        let posVal = AXValueCreate(.cgPoint, &pos)!
+        let sizeVal = AXValueCreate(.cgSize, &size)!
+        AXUIElementSetAttributeValue(win.element, kAXPositionAttribute as CFString, posVal)
+        AXUIElementSetAttributeValue(win.element, kAXSizeAttribute as CFString, sizeVal)
+        log("девятое и далее окно — сразу растянуто поверх сетки: \(win.owner)")
     }
 
     // MARK: список окон
