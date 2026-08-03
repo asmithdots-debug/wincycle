@@ -15,10 +15,67 @@
 
 import AppKit
 
+// Отдельного вкл/выкл нет ни у затемнения, ни у стекла — ползунок на 0%
+// уже и есть «выключено», третье состояние было бы лишним.
 private enum Key {
-    static let dimEnabled = "wincycle.dimEnabled"
     static let dimLevel = "wincycle.dimLevel"
-    static let glassEnabled = "wincycle.glassEnabled"
+    static let glassTintLevel = "wincycle.glassTintLevel"
+    // Настоящее значение NSGlassTintAmount до того, как WinCycle его вообще
+    // тронул, — хранится на диске (не только в памяти Controller), потому
+    // что ползунок теперь перезапускает процесс (см. relaunchSelf()): без
+    // этого следующий процесс в цепочке перезапусков принял бы уже
+    // записанное WinCycle значение за «оригинал» и в итоге не восстановил
+    // бы настоящее системное при выключении.
+    static let hasSavedSystemGlassTint = "wincycle.hasSavedSystemGlassTint"
+    static let savedSystemGlassTint = "wincycle.savedSystemGlassTint"
+}
+
+// Системный ключ за ползунком «Liquid Glass» в Системные настройки → Оформ-
+// ление (найден через `defaults read -g`, не документирован Apple). Это
+// ГЛОБАЛЬНАЯ настройка на весь стакан Liquid Glass в системе, а не свойство
+// одного окна: у самого NSGlassEffectView нет параметра силы размытия (см.
+// DESIGN.md), поэтому единственный способ её регулировать — через этот
+// ключ в NSGlobalDomain, а значит правка отражается на Safari, Finder,
+// Системных настройках и так далее, пока WinCycle его не вернёт обратно.
+//
+// Читаем и пишем через сам /usr/bin/defaults, а не через CFPreferences
+// напрямую: на этой версии системы CFPreferencesSetValue/CFPreferencesCopy-
+// Value с kCFPreferencesAnyApplication (и явным "NSGlobalDomain") молча
+// уходят в другое хранилище, не то же самое, что читает `defaults -g` и
+// сама System Settings, — проверено эмпирически: запись через CFPreferences
+// не отражалась во внешнем `defaults read -g`, а `defaults write -g` из
+// шелла отражалась всегда. Раз единственный публично подтверждённый рабочий
+// путь — сам CLI-инструмент, используем его, а не гадаем дальше про приватную
+// прослойку cfprefsd.
+private func readGlobalGlassTint() -> Double? {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+    task.arguments = ["read", "-g", "NSGlassTintAmount"]
+    let out = Pipe()
+    task.standardOutput = out
+    task.standardError = Pipe()
+    guard (try? task.run()) != nil else { return nil }
+    task.waitUntilExit()
+    guard task.terminationStatus == 0 else { return nil }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    guard let text = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    else { return nil }
+    return Double(text)
+}
+
+private func writeGlobalGlassTint(_ value: Double?) {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+    if let value {
+        task.arguments = ["write", "-g", "NSGlassTintAmount", "-float", String(value)]
+    } else {
+        task.arguments = ["delete", "-g", "NSGlassTintAmount"]
+    }
+    task.standardOutput = Pipe()
+    task.standardError = Pipe()
+    guard (try? task.run()) != nil else { return }
+    task.waitUntilExit()
 }
 
 // Приложения, чьи окна не должны учитываться при затемнении, даже когда
@@ -44,10 +101,18 @@ final class ShadeView: NSView {
 final class Overlay: NSWindow {
     let shade = ShadeView()
     // NSGlassEffectView существует только с macOS 26 — заведён как обычный
-    // NSView?, чтобы не тащить условную компиляцию через весь файл. Экспе-
-    // римент: у класса нет параметра силы/радиуса размытия (см. DESIGN.md),
-    // поэтому это просто вкл/выкл поверх уже работающего затемнения, а не
-    // замена ему.
+    // NSView?, чтобы не тащить условную компиляцию через весь файл.
+    //
+    // NSGlassEffectView читает глобальный NSGlassTintAmount (см. объявление
+    // ключа у Controller) ровно один раз за весь процесс — не за окно, не
+    // за конкретный экземпляр вью. Ни переписывание значения на месте, ни
+    // пересоздание того же вью, ни даже создание совсем нового окна внутри
+    // ТОГО ЖЕ процесса ничего не меняют — проверено попарным сравнением
+    // скриншотов (пиксель в пиксель одинаковые при 2% и 91%, edge-энергия
+    // совпадает с точностью до шума). Меняется только между разными
+    // ПРОЦЕССАМИ. Поэтому единственный работающий способ дать пользователю
+    // живой ползунок — перезапускать сам процесс WinCycle при отпускании
+    // ползунка (Controller.relaunchSelf()), а не подстраивать это окно.
     private var glass: NSView?
 
     init(screen: NSScreen) {
@@ -103,10 +168,22 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var overlays: [Overlay] = []
     private var dimTimer: Timer?
     private var lastFront: CGWindowID = 0
-    private var dimEnabled = true
     private var dimLevel = 35
     private var dimValueLabel: NSTextField?
-    private var glassEnabled = false
+    private var glassTintLevel = 0
+    private var glassTintValueLabel: NSTextField?
+    // Значение NSGlassTintAmount в NSGlobalDomain, каким оно было ДО того,
+    // как WinCycle его тронул, — чтобы вернуть на выходе. savedGlobalGlassTint
+    // == nil среди прочего значит «ключа не было вовсе», тогда на выходе его
+    // нужно не записать, а убрать; glassTintSaved отличает это от «ещё не
+    // сохраняли».
+    private var glassTintSaved = false
+    private var savedGlobalGlassTint: Double?
+    // true между вызовом relaunchSelf() и фактическим завершением процесса —
+    // отличает намеренный самоперезапуск от настоящего выхода в
+    // applicationWillTerminate(): при самоперезапуске откатывать
+    // NSGlassTintAmount нельзя, иначе новый процесс увидит старое значение.
+    private var isRelaunching = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -115,9 +192,21 @@ final class Controller: NSObject, NSApplicationDelegate {
         // переставляли бы подложки на каждом такте. Такое случается, когда
         // приложение поднимают и вручную, и службой автозапуска.
         let me = ProcessInfo.processInfo.processIdentifier
-        let twins = NSRunningApplication.runningApplications(
-            withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.wincycle"
-        ).filter { $0.processIdentifier != me }
+        let bundleID = Bundle.main.bundleIdentifier ?? "local.wincycle"
+        func otherCopies() -> [NSRunningApplication] {
+            NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                .filter { $0.processIdentifier != me }
+        }
+        var twins = otherCopies()
+        // Самоперезапуск (см. relaunchSelf()) на секунду-другую даёт увидеть
+        // ещё живую предыдущую копию, пока та завершается, — не считать
+        // это дублем сразу, а подождать немного, прежде чем сдаваться.
+        var attempts = 0
+        while !twins.isEmpty, attempts < 20 {
+            Thread.sleep(forTimeInterval: 0.1)
+            twins = otherCopies()
+            attempts += 1
+        }
         if !twins.isEmpty {
             log("уже запущена другая копия — выхожу")
             NSApp.terminate(nil)
@@ -125,16 +214,25 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         let defaults = UserDefaults.standard
-        defaults.register(defaults: [
-            Key.dimEnabled: true, Key.dimLevel: 35, Key.glassEnabled: false,
-        ])
-        dimEnabled = defaults.bool(forKey: Key.dimEnabled)
+        defaults.register(defaults: [Key.dimLevel: 35, Key.glassTintLevel: 0])
         dimLevel = defaults.integer(forKey: Key.dimLevel)
-        glassEnabled = defaults.bool(forKey: Key.glassEnabled)
+        glassTintLevel = defaults.integer(forKey: Key.glassTintLevel)
 
         log("запуск")
         buildStatusItem()
         startDimming()
+        if glassTintLevel > 0 { applyGlobalGlassTint() }
+    }
+
+    func applicationWillTerminate(_ note: Notification) {
+        // При самоперезапуске (isRelaunching) откатывать нечего — наоборот,
+        // именно это новое значение должен увидеть свежий процесс.
+        guard !isRelaunching else { return }
+        // Подстраховка на случай выхода не через наш пункт «Выход» (Cmd+Q,
+        // принудительное завершение через Activity Monitor и так далее) —
+        // без этого глобальный NSGlassTintAmount остался бы гулять по всей
+        // системе и после закрытия WinCycle.
+        if glassTintSaved { restoreGlobalGlassTint() }
     }
 
     // MARK: затемнение
@@ -219,7 +317,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     private func updateDimming(force: Bool) {
-        guard dimEnabled || glassEnabled else {
+        guard dimLevel > 0 || glassTintLevel > 0 else {
             hideOverlays()
             return
         }
@@ -235,10 +333,10 @@ final class Controller: NSObject, NSApplicationDelegate {
             hideOverlays()
             return
         }
-        let alpha = dimEnabled ? CGFloat(dimLevel) / 100 : 0
+        let alpha = CGFloat(dimLevel) / 100
         for overlay in overlays {
             overlay.apply(alpha: alpha)
-            overlay.setGlass(enabled: glassEnabled)
+            overlay.setGlass(enabled: glassTintLevel > 0)
         }
 
         // Порядок окон трогаем только когда активное сменилось: постоянная
@@ -295,26 +393,14 @@ final class Controller: NSObject, NSApplicationDelegate {
     private func rebuildMenu() {
         let menu = NSMenu()
 
-        let toggle = NSMenuItem(
-            title: "Затемнять неактивные окна", action: #selector(toggleDim),
-            keyEquivalent: "")
-        toggle.target = self
-        toggle.state = dimEnabled ? .on : .off
-        menu.addItem(toggle)
-
-        if dimEnabled {
-            let sliderItem = NSMenuItem()
-            sliderItem.view = makeDimSliderView()
-            menu.addItem(sliderItem)
-        }
+        let dimSliderItem = NSMenuItem()
+        dimSliderItem.view = makeDimSliderView()
+        menu.addItem(dimSliderItem)
 
         if #available(macOS 26.0, *) {
-            let glassItem = NSMenuItem(
-                title: "Жидкое стекло (эксперимент)", action: #selector(toggleGlass),
-                keyEquivalent: "")
-            glassItem.target = self
-            glassItem.state = glassEnabled ? .on : .off
-            menu.addItem(glassItem)
+            let glassSliderItem = NSMenuItem()
+            glassSliderItem.view = makeGlassSliderView()
+            menu.addItem(glassSliderItem)
         }
 
         menu.addItem(.separator())
@@ -324,25 +410,113 @@ final class Controller: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc private func toggleDim() {
-        dimEnabled.toggle()
-        UserDefaults.standard.set(dimEnabled, forKey: Key.dimEnabled)
-        rebuildMenu()
-        updateDimming(force: true)
+    // MARK: NSGlassTintAmount (глобальный, см. объявление ключа выше)
+
+    private func applyGlobalGlassTint() {
+        if !glassTintSaved {
+            let defaults = UserDefaults.standard
+            if defaults.bool(forKey: Key.hasSavedSystemGlassTint) {
+                // Уже сохранён раньше — в том числе, возможно, ПРЕДЫДУЩИМ
+                // процессом в этой же цепочке самоперезапусков. Текущее
+                // значение NSGlassTintAmount сейчас — это уже значение,
+                // которое туда положил сам WinCycle, а не настоящий
+                // оригинал, так что читать его заново нельзя.
+                savedGlobalGlassTint = defaults.object(forKey: Key.savedSystemGlassTint) as? Double
+            } else {
+                savedGlobalGlassTint = readGlobalGlassTint()
+                defaults.set(true, forKey: Key.hasSavedSystemGlassTint)
+                if let value = savedGlobalGlassTint {
+                    defaults.set(value, forKey: Key.savedSystemGlassTint)
+                } else {
+                    defaults.removeObject(forKey: Key.savedSystemGlassTint)
+                }
+            }
+            glassTintSaved = true
+        }
+        writeGlobalGlassTint(Double(glassTintLevel) / 100)
     }
 
-    @objc private func toggleGlass() {
-        glassEnabled.toggle()
-        UserDefaults.standard.set(glassEnabled, forKey: Key.glassEnabled)
-        rebuildMenu()
+    private func restoreGlobalGlassTint() {
+        guard glassTintSaved else { return }
+        writeGlobalGlassTint(savedGlobalGlassTint)
+        glassTintSaved = false
+        let defaults = UserDefaults.standard
+        defaults.set(false, forKey: Key.hasSavedSystemGlassTint)
+        defaults.removeObject(forKey: Key.savedSystemGlassTint)
+    }
+
+    // NSGlassEffectView читает NSGlassTintAmount ровно один раз за весь
+    // процесс (см. комментарий у Overlay) — единственный способ показать
+    // новое значение живьём - перезапустить сам процесс WinCycle.
+    //
+    // Пробовали execv (замена образа текущего процесса на свежий, тот же
+    // PID) — технически перезапускает и подхватывает новое значение, но
+    // соединение со строкой меню это не переживает: значок WinCycle просто
+    // пропадает насовсем, потому что execv не даёт AppKit нормально закрыть
+    // старое соединение с оконным сервером перед тем, как его заменят.
+    // Вместо этого — честный новый процесс (`open -n`) и завершение
+    // старого через обычный NSApp.terminate(nil): так строка меню
+    // освобождается штатно, как при обычном выходе.
+    private func relaunchSelf() {
+        isRelaunching = true
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-n", Bundle.main.bundlePath]
+        try? task.run()
+        NSApp.terminate(nil)
+    }
+
+    private func makeGlassSliderView() -> NSView {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 34))
+
+        let label = NSTextField(labelWithString: "Размытие стекла: \(glassTintLevel)%")
+        label.font = NSFont.menuFont(ofSize: 0)
+        label.frame = NSRect(x: 18, y: 18, width: 190, height: 16)
+        container.addSubview(label)
+        glassTintValueLabel = label
+
+        let slider = NSSlider(frame: NSRect(x: 18, y: 2, width: 190, height: 18))
+        slider.minValue = 0
+        slider.maxValue = 100
+        slider.integerValue = glassTintLevel
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(glassSliderChanged(_:))
+        container.addSubview(slider)
+
+        return container
+    }
+
+    @objc private func glassSliderChanged(_ sender: NSSlider) {
+        glassTintLevel = sender.integerValue
+        glassTintValueLabel?.stringValue = "Размытие стекла: \(glassTintLevel)%"
+        UserDefaults.standard.set(glassTintLevel, forKey: Key.glassTintLevel)
+
+        // Ключ глобальный (см. объявление выше) — переставать его трогать
+        // нужно ровно на переходе через 0, а не при каждом движении: 0%
+        // и есть «выключено», applyGlobalGlassTint() сама решает, сохранять
+        // ли оригинал заново (не сохранит второй раз, если уже включено).
+        if glassTintLevel > 0 {
+            applyGlobalGlassTint()
+        } else if glassTintSaved {
+            restoreGlobalGlassTint()
+        }
         updateDimming(force: true)
+
+        // Само значение стекло подхватит только в новом процессе (см.
+        // relaunchSelf()) — перезапускаем не на каждый шаг перетаскивания
+        // (иначе за одно движение ползунка их были бы десятки), а один раз,
+        // когда мышь отпустили.
+        if NSApp.currentEvent?.type == .leftMouseUp {
+            relaunchSelf()
+        }
     }
 
     // Ползунок живёт в собственном NSView внутри NSMenuItem — так меню не
     // закрывается и не перестраивается на каждое движение мыши, как было бы
-    // с обычными пунктами меню. rebuildMenu() тут нарочно не вызываем: он
-    // пересоздал бы весь NSMenu прямо во время перетаскивания и оборвал бы
-    // его — в отличие от toggleDim(), где на пункт можно просто кликнуть.
+    // с обычными пунктами меню. rebuildMenu() тут нарочно не вызываем при
+    // движении — он пересоздал бы весь NSMenu прямо во время перетаскивания
+    // и оборвал бы его.
     private func makeDimSliderView() -> NSView {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 34))
 

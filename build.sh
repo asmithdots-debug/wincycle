@@ -20,10 +20,9 @@ if [ ! -f "$KEYCHAIN" ]; then
     echo "Связки для подписи ещё нет. Сначала запустите ./setup-signing.sh"
     exit 1
 fi
-mkdir -p "$APP/Contents/MacOS"
-if [ ! -f "$APP/Contents/Info.plist" ]; then
-    cp "$(dirname "$0")/Info.plist" "$APP/Contents/Info.plist"
-fi
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Info.plist "$APP/Contents/Info.plist"
+cp WinCycle.icns "$APP/Contents/Resources/WinCycle.icns"
 
 echo "сборка…"
 swiftc -O main.swift -o WinCycle -framework AppKit
