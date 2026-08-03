@@ -20,8 +20,6 @@ private enum Key {
     static let dimLevel = "wincycle.dimLevel"
 }
 
-private let dimSteps = [15, 25, 35, 45, 55, 70]
-
 // Приложения, чьи окна не должны учитываться при затемнении, даже когда
 // формально проходят все обычные проверки (обычное окно, видимое, полная
 // непрозрачность). Обнаружено на живом примере: фоновое окно VPN-клиента
@@ -82,6 +80,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var lastFront: CGWindowID = 0
     private var dimEnabled = true
     private var dimLevel = 35
+    private var dimValueLabel: NSTextField?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -272,18 +271,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         menu.addItem(toggle)
 
         if dimEnabled {
-            let strength = NSMenuItem(title: "Сила затемнения", action: nil, keyEquivalent: "")
-            let submenu = NSMenu()
-            for value in dimSteps {
-                let item = NSMenuItem(
-                    title: "\(value) %", action: #selector(setDim(_:)), keyEquivalent: "")
-                item.target = self
-                item.tag = value
-                item.state = value == dimLevel ? .on : .off
-                submenu.addItem(item)
-            }
-            strength.submenu = submenu
-            menu.addItem(strength)
+            let sliderItem = NSMenuItem()
+            sliderItem.view = makeDimSliderView()
+            menu.addItem(sliderItem)
         }
 
         menu.addItem(.separator())
@@ -300,10 +290,36 @@ final class Controller: NSObject, NSApplicationDelegate {
         updateDimming(force: true)
     }
 
-    @objc private func setDim(_ sender: NSMenuItem) {
-        dimLevel = sender.tag
+    // Ползунок живёт в собственном NSView внутри NSMenuItem — так меню не
+    // закрывается и не перестраивается на каждое движение мыши, как было бы
+    // с обычными пунктами меню. rebuildMenu() тут нарочно не вызываем: он
+    // пересоздал бы весь NSMenu прямо во время перетаскивания и оборвал бы
+    // его — в отличие от toggleDim(), где на пункт можно просто кликнуть.
+    private func makeDimSliderView() -> NSView {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 34))
+
+        let label = NSTextField(labelWithString: "Сила затемнения: \(dimLevel)%")
+        label.font = NSFont.menuFont(ofSize: 0)
+        label.frame = NSRect(x: 18, y: 18, width: 190, height: 16)
+        container.addSubview(label)
+        dimValueLabel = label
+
+        let slider = NSSlider(frame: NSRect(x: 18, y: 2, width: 190, height: 18))
+        slider.minValue = 0
+        slider.maxValue = 100
+        slider.integerValue = dimLevel
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(sliderChanged(_:))
+        container.addSubview(slider)
+
+        return container
+    }
+
+    @objc private func sliderChanged(_ sender: NSSlider) {
+        dimLevel = sender.integerValue
+        dimValueLabel?.stringValue = "Сила затемнения: \(dimLevel)%"
         UserDefaults.standard.set(dimLevel, forKey: Key.dimLevel)
-        rebuildMenu()
         updateDimming(force: true)
     }
 
