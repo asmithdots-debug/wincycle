@@ -18,6 +18,7 @@ import AppKit
 private enum Key {
     static let dimEnabled = "wincycle.dimEnabled"
     static let dimLevel = "wincycle.dimLevel"
+    static let glassEnabled = "wincycle.glassEnabled"
 }
 
 // Приложения, чьи окна не должны учитываться при затемнении, даже когда
@@ -42,6 +43,12 @@ final class ShadeView: NSView {
 
 final class Overlay: NSWindow {
     let shade = ShadeView()
+    // NSGlassEffectView существует только с macOS 26 — заведён как обычный
+    // NSView?, чтобы не тащить условную компиляцию через весь файл. Экспе-
+    // римент: у класса нет параметра силы/радиуса размытия (см. DESIGN.md),
+    // поэтому это просто вкл/выкл поверх уже работающего затемнения, а не
+    // замена ему.
+    private var glass: NSView?
 
     init(screen: NSScreen) {
         super.init(
@@ -56,9 +63,23 @@ final class Overlay: NSWindow {
             .canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary,
         ]
 
-        shade.frame = NSRect(origin: .zero, size: screen.frame.size)
+        let container = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        container.autoresizingMask = [.width, .height]
+
+        if #available(macOS 26.0, *) {
+            let glassView = NSGlassEffectView(frame: container.bounds)
+            glassView.autoresizingMask = [.width, .height]
+            glassView.tintColor = .clear
+            glassView.isHidden = true
+            container.addSubview(glassView)
+            glass = glassView
+        }
+
+        shade.frame = container.bounds
         shade.autoresizingMask = [.width, .height]
-        contentView = shade
+        container.addSubview(shade)
+
+        contentView = container
         setFrame(screen.frame, display: false)
     }
 
@@ -69,6 +90,10 @@ final class Overlay: NSWindow {
         guard shade.dimAlpha != alpha else { return }
         shade.dimAlpha = alpha
         shade.needsDisplay = true
+    }
+
+    func setGlass(enabled: Bool) {
+        glass?.isHidden = !enabled
     }
 }
 
@@ -81,6 +106,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var dimEnabled = true
     private var dimLevel = 35
     private var dimValueLabel: NSTextField?
+    private var glassEnabled = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -99,9 +125,12 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         let defaults = UserDefaults.standard
-        defaults.register(defaults: [Key.dimEnabled: true, Key.dimLevel: 35])
+        defaults.register(defaults: [
+            Key.dimEnabled: true, Key.dimLevel: 35, Key.glassEnabled: false,
+        ])
         dimEnabled = defaults.bool(forKey: Key.dimEnabled)
         dimLevel = defaults.integer(forKey: Key.dimLevel)
+        glassEnabled = defaults.bool(forKey: Key.glassEnabled)
 
         log("запуск")
         buildStatusItem()
@@ -190,7 +219,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     private func updateDimming(force: Bool) {
-        guard dimEnabled else {
+        guard dimEnabled || glassEnabled else {
             hideOverlays()
             return
         }
@@ -206,8 +235,11 @@ final class Controller: NSObject, NSApplicationDelegate {
             hideOverlays()
             return
         }
-        let alpha = CGFloat(dimLevel) / 100
-        for overlay in overlays { overlay.apply(alpha: alpha) }
+        let alpha = dimEnabled ? CGFloat(dimLevel) / 100 : 0
+        for overlay in overlays {
+            overlay.apply(alpha: alpha)
+            overlay.setGlass(enabled: glassEnabled)
+        }
 
         // Порядок окон трогаем только когда активное сменилось: постоянная
         // перестановка даёт мерцание.
@@ -276,6 +308,15 @@ final class Controller: NSObject, NSApplicationDelegate {
             menu.addItem(sliderItem)
         }
 
+        if #available(macOS 26.0, *) {
+            let glassItem = NSMenuItem(
+                title: "Жидкое стекло (эксперимент)", action: #selector(toggleGlass),
+                keyEquivalent: "")
+            glassItem.target = self
+            glassItem.state = glassEnabled ? .on : .off
+            menu.addItem(glassItem)
+        }
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
@@ -286,6 +327,13 @@ final class Controller: NSObject, NSApplicationDelegate {
     @objc private func toggleDim() {
         dimEnabled.toggle()
         UserDefaults.standard.set(dimEnabled, forKey: Key.dimEnabled)
+        rebuildMenu()
+        updateDimming(force: true)
+    }
+
+    @objc private func toggleGlass() {
+        glassEnabled.toggle()
+        UserDefaults.standard.set(glassEnabled, forKey: Key.glassEnabled)
         rebuildMenu()
         updateDimming(force: true)
     }
