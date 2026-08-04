@@ -162,8 +162,11 @@ final class Overlay: NSWindow {
         shade.needsDisplay = true
     }
 
+    // Проверка на «уже так и есть» не для красоты: это дёргается на каждом
+    // такте опроса, двадцать раз в секунду.
     func setGlass(enabled: Bool) {
-        glass?.isHidden = !enabled
+        guard let glass, glass.isHidden == enabled else { return }
+        glass.isHidden = !enabled
     }
 }
 
@@ -312,16 +315,47 @@ final class Controller: NSObject, NSApplicationDelegate {
             self, selector: #selector(appActivated),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
 
-        let timer = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
+        // Такт опроса — 50 мс. Переключение между окнами ОДНОЙ программы
+        // система не сообщает ничем, его ловит только опрос, поэтому такт и
+        // есть верхняя граница задержки в этом случае: при 0.3 с реакция
+        // отставала в среднем на 120 мс и до 215 мс в худшем случае (замерено)
+        // — это и ощущалось как провал. Один такт стоит доли миллисекунды,
+        // так что 50 мс обходятся примерно в полпроцента одного ядра.
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.updateDimming(force: false)
         }
+        timer.tolerance = 0
         RunLoop.main.add(timer, forMode: .common)
         dimTimer = timer
 
         updateDimming(force: true)
     }
 
-    @objc private func appActivated() { updateDimming(force: true) }
+    // Уведомление о смене активной программы приходит РАНЬШЕ, чем система
+    // перестраивает список окон: в момент сигнала самым передним нередко
+    // всё ещё числится окно старой программы (проверено — так бывает не
+    // всегда, но регулярно). Если сразу поверить списку, подложка встанет
+    // под старое окно, то есть на мгновение потемнеет ровно то окно, на
+    // которое переключились, и разошлось бы это только следующим тактом.
+    // Поэтому ждём, пока переднее окно не окажется окном той программы, о
+    // которой пришло уведомление.
+    @objc private func appActivated(_ note: Notification) {
+        let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        followActivation(of: app?.processIdentifier, until: Date().addingTimeInterval(0.4))
+    }
+
+    // Предел в 0.4 с — на случай, когда переднего окна у программы так и не
+    // появится (активировали программу вообще без окон, например): тогда
+    // просто обновляемся по тому, что есть.
+    private func followActivation(of pid: pid_t?, until deadline: Date) {
+        guard let pid, realWindows().first?.owner != pid, Date() < deadline else {
+            updateDimming(force: true)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.008) { [weak self] in
+            self?.followActivation(of: pid, until: deadline)
+        }
+    }
 
     @objc private func screensChanged() { rebuildOverlays() }
 
@@ -338,20 +372,32 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     // Обычные окна на экране, спереди назад, как их отдаёт системный список,
-    // вместе с их рамкой (нужна рамке подсветки активного окна). Мелкие
-    // всплывающие панельки, окна нерегулярных программ (значки в строке
-    // меню и подобные, включая наши собственные подложки) и окна программ,
-    // спрятанных через Command+H, в список не попадают.
-    private func realWindows() -> [(id: CGWindowID, bounds: CGRect)] {
+    // вместе с их рамкой (нужна рамке подсветки активного окна) и pid
+    // программы-владельца (нужен, чтобы после переключения дождаться, когда
+    // система реально поднимет окно новой программы). Мелкие всплывающие
+    // панельки, окна нерегулярных программ (значки в строке меню и подобные,
+    // включая наши собственные подложки) и окна программ, спрятанных через
+    // Command+H, в список не попадают.
+    //
+    // Дальше двух подходящих окон список не строим: наружу нужно только
+    // самое переднее окно и признак «оно тут не одно». Опрос идёт двадцать
+    // раз в секунду, и разбирать на каждом такте весь список — ровно та
+    // лишняя работа, ради которой такт раньше и держали редким.
+    //
+    // По той же причине список держим как NSArray/NSDictionary, а не
+    // приводим к [[String: Any]]: приведение переводит в свифтовые типы
+    // ВЕСЬ массив разом, включая окна, до которых мы не дойдём. Ленивый
+    // разбор поэлементно дешевле втрое (замерено).
+    private func realWindows() -> [(id: CGWindowID, bounds: CGRect, owner: pid_t)] {
         let mine = Set(overlays.map { CGWindowID($0.windowNumber) })
         guard
             let list = CGWindowListCopyWindowInfo(
-                [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]]
+                [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as NSArray?
         else { return [] }
 
-        var result: [(id: CGWindowID, bounds: CGRect)] = []
-        for info in list {
+        var result: [(id: CGWindowID, bounds: CGRect, owner: pid_t)] = []
+        for entry in list {
+            guard let info = entry as? NSDictionary else { continue }
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
                 let number = info[kCGWindowNumber as String] as? CGWindowID,
                 !mine.contains(number)
@@ -359,24 +405,26 @@ final class Controller: NSObject, NSApplicationDelegate {
             if let alpha = info[kCGWindowAlpha as String] as? Double, alpha < 0.01 {
                 continue
             }
-            guard let rawBounds = info[kCGWindowBounds as String] as? [String: CGFloat] else {
+            guard let rawBounds = info[kCGWindowBounds as String] as? NSDictionary else {
                 continue
             }
             let bounds = CGRect(
-                x: rawBounds["X"] ?? 0, y: rawBounds["Y"] ?? 0,
-                width: rawBounds["Width"] ?? 0, height: rawBounds["Height"] ?? 0)
+                x: (rawBounds["X"] as? NSNumber)?.doubleValue ?? 0,
+                y: (rawBounds["Y"] as? NSNumber)?.doubleValue ?? 0,
+                width: (rawBounds["Width"] as? NSNumber)?.doubleValue ?? 0,
+                height: (rawBounds["Height"] as? NSNumber)?.doubleValue ?? 0)
             // мелочь вроде всплывающих панелек не считаем отдельным окном
             if bounds.width < 100 || bounds.height < 100 { continue }
-            if let pid = info[kCGWindowOwnerPID as String] as? pid_t,
-                let owner = NSRunningApplication(processIdentifier: pid)
-            {
+            let pid = info[kCGWindowOwnerPID as String] as? pid_t ?? 0
+            if pid != 0, let owner = NSRunningApplication(processIdentifier: pid) {
                 if owner.activationPolicy != .regular { continue }
                 if owner.isHidden { continue }
                 if let bundleID = owner.bundleIdentifier, ignoredBundleIDs.contains(bundleID) {
                     continue
                 }
             }
-            result.append((number, bounds))
+            result.append((number, bounds, pid))
+            if result.count >= 2 { break }
         }
         return result
     }
@@ -421,7 +469,10 @@ final class Controller: NSObject, NSApplicationDelegate {
         lastFront = front
 
         for overlay in overlays {
-            overlay.orderFront(nil)
+            // Именно orderFrontRegardless: обычный orderFront у программы,
+            // которая не активна (а WinCycle не активна никогда), AppKit
+            // вправе отложить до её активации.
+            overlay.orderFrontRegardless()
             overlay.order(.below, relativeTo: Int(front))
         }
     }
