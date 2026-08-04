@@ -94,25 +94,12 @@ private let ignoredBundleIDs: Set<String> = [
 final class ShadeView: NSView {
     var dimAlpha: CGFloat = 0.35
 
-    // Виньетка вместо плоской заливки: в центре экрана прозрачно, к краям —
-    // темнее, до dimAlpha. Тот же ползунок «Сила затемнения» задаёт
-    // максимальную (краевую) темноту, просто форма другая — плоская заливка
-    // выглядела как ровная серая пелена, виньетка мягче и меньше похожа на
-    // «весь экран одним цветом».
+    // Закрашивает всю подложку одним полупрозрачным чёрным цветом — сила
+    // (dimAlpha) задаётся ползунком «Сила затемнения».
     override func draw(_ dirtyRect: NSRect) {
-        guard dimAlpha > 0, let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let colors = [
-            NSColor.clear.cgColor,
-            NSColor.black.withAlphaComponent(dimAlpha).cgColor,
-        ]
-        let gradient = CGGradient(
-            colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors as CFArray,
-            locations: [0.4, 1.0])!
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let radius = max(bounds.width, bounds.height) * 0.75
-        ctx.drawRadialGradient(
-            gradient, startCenter: center, startRadius: 0, endCenter: center, endRadius: radius,
-            options: [])
+        guard dimAlpha > 0 else { return }
+        NSColor.black.withAlphaComponent(dimAlpha).setFill()
+        bounds.fill()
     }
 }
 
