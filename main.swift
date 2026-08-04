@@ -491,6 +491,24 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     // MARK: строка меню
+    //
+    // Раньше здесь был настоящий NSMenu с ползунками в кастомных NSView
+    // внутри NSMenuItem — стандартный на вид приём, но с багом: у NSMenu
+    // есть отдельная, недокументированная сессия отслеживания мыши для
+    // вью внутри пункта меню, и после ПЕРВОГО полного перетаскивания
+    // (mouseDown → mouseDragged → mouseUp) она перестаёт передавать
+    // дальнейшие события вью, пока меню не закроется и не откроется заново.
+    // Один раз ползунок подвинуть можно, второй раз в ТОМ ЖЕ открытом меню —
+    // уже нет; закрыть и открыть меню заново — и снова можно подвинуть ровно
+    // один раз. Подтверждено вживую (см. DESIGN.md).
+    //
+    // NSPopover, в отличие от NSMenu, — обычное окно AppKit без этой особой
+    // сессии отслеживания: обычные виджеты внутри него ведут себя как в
+    // любом другом окне, ползунки и чекбокс можно трогать сколько угодно
+    // раз подряд без переоткрытия.
+
+    private let popover = NSPopover()
+    private var borderCheckbox: NSButton?
 
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -502,35 +520,59 @@ final class Controller: NSObject, NSApplicationDelegate {
             } else {
                 button.title = "⧉"
             }
+            button.target = self
+            button.action = #selector(toggleStatusPopover(_:))
         }
-        rebuildMenu()
+
+        popover.behavior = .transient
+        let controller = NSViewController()
+        controller.view = makePopoverContentView()
+        popover.contentViewController = controller
     }
 
-    private func rebuildMenu() {
-        let menu = NSMenu()
+    @objc private func toggleStatusPopover(_ sender: NSStatusBarButton) {
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+        }
+    }
 
-        let dimSliderItem = NSMenuItem()
-        dimSliderItem.view = makeDimSliderView()
-        menu.addItem(dimSliderItem)
+    private func makePopoverContentView() -> NSView {
+        let width: CGFloat = 220
+        var y: CGFloat = 12
 
+        let quit = NSButton(title: "Выход", target: self, action: #selector(quit))
+        quit.bezelStyle = .rounded
+        quit.frame = NSRect(x: 18, y: y, width: 80, height: 20)
+        y += 20 + 12
+
+        let border = NSButton(
+            checkboxWithTitle: "Рамка вокруг активного окна", target: self,
+            action: #selector(toggleBorder(_:)))
+        border.state = borderEnabled ? .on : .off
+        border.frame = NSRect(x: 18, y: y, width: 190, height: 18)
+        borderCheckbox = border
+        y += 18 + 10
+
+        var glassView: NSView?
         if #available(macOS 26.0, *) {
-            let glassSliderItem = NSMenuItem()
-            glassSliderItem.view = makeGlassSliderView()
-            menu.addItem(glassSliderItem)
+            let view = makeGlassSliderView()
+            view.frame.origin.y = y
+            glassView = view
+            y += 34 + 4
         }
 
-        let borderItem = NSMenuItem(
-            title: "Рамка вокруг активного окна", action: #selector(toggleBorder),
-            keyEquivalent: "")
-        borderItem.target = self
-        borderItem.state = borderEnabled ? .on : .off
-        menu.addItem(borderItem)
+        let dimView = makeDimSliderView()
+        dimView.frame.origin.y = y
+        y += 34 + 8
 
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-        statusItem.menu = menu
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: y))
+        container.addSubview(dimView)
+        if let glassView { container.addSubview(glassView) }
+        container.addSubview(border)
+        container.addSubview(quit)
+        return container
     }
 
     // MARK: NSGlassTintAmount (глобальный, см. объявление ключа выше)
@@ -593,7 +635,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 34))
 
         let label = NSTextField(labelWithString: "Размытие стекла: \(glassTintLevel)%")
-        label.font = NSFont.menuFont(ofSize: 0)
+        label.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
         label.frame = NSRect(x: 18, y: 18, width: 190, height: 16)
         container.addSubview(label)
         glassTintValueLabel = label
@@ -635,16 +677,11 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Ползунок живёт в собственном NSView внутри NSMenuItem — так меню не
-    // закрывается и не перестраивается на каждое движение мыши, как было бы
-    // с обычными пунктами меню. rebuildMenu() тут нарочно не вызываем при
-    // движении — он пересоздал бы весь NSMenu прямо во время перетаскивания
-    // и оборвал бы его.
     private func makeDimSliderView() -> NSView {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 34))
 
         let label = NSTextField(labelWithString: "Сила затемнения: \(dimLevel)%")
-        label.font = NSFont.menuFont(ofSize: 0)
+        label.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
         label.frame = NSRect(x: 18, y: 18, width: 190, height: 16)
         container.addSubview(label)
         dimValueLabel = label
@@ -668,10 +705,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         updateDimming(force: true)
     }
 
-    @objc private func toggleBorder() {
-        borderEnabled.toggle()
+    @objc private func toggleBorder(_ sender: NSButton) {
+        borderEnabled = sender.state == .on
         UserDefaults.standard.set(borderEnabled, forKey: Key.borderEnabled)
-        rebuildMenu()
         updateDimming(force: true)
     }
 
