@@ -28,6 +28,8 @@ private enum Key {
     // бы настоящее системное при выключении.
     static let hasSavedSystemGlassTint = "wincycle.hasSavedSystemGlassTint"
     static let savedSystemGlassTint = "wincycle.savedSystemGlassTint"
+    // У рамки, в отличие от затемнения и стекла, нет «силы» — только вкл/выкл.
+    static let borderEnabled = "wincycle.borderEnabled"
 }
 
 // Системный ключ за ползунком «Liquid Glass» в Системные настройки → Оформ-
@@ -92,9 +94,25 @@ private let ignoredBundleIDs: Set<String> = [
 final class ShadeView: NSView {
     var dimAlpha: CGFloat = 0.35
 
+    // Виньетка вместо плоской заливки: в центре экрана прозрачно, к краям —
+    // темнее, до dimAlpha. Тот же ползунок «Сила затемнения» задаёт
+    // максимальную (краевую) темноту, просто форма другая — плоская заливка
+    // выглядела как ровная серая пелена, виньетка мягче и меньше похожа на
+    // «весь экран одним цветом».
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.withAlphaComponent(dimAlpha).setFill()
-        dirtyRect.fill()
+        guard dimAlpha > 0, let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let colors = [
+            NSColor.clear.cgColor,
+            NSColor.black.withAlphaComponent(dimAlpha).cgColor,
+        ]
+        let gradient = CGGradient(
+            colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors as CFArray,
+            locations: [0.4, 1.0])!
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let radius = max(bounds.width, bounds.height) * 0.75
+        ctx.drawRadialGradient(
+            gradient, startCenter: center, startRadius: 0, endCenter: center, endRadius: radius,
+            options: [])
     }
 }
 
@@ -162,6 +180,56 @@ final class Overlay: NSWindow {
     }
 }
 
+// MARK: - Рамка вокруг активного окна
+
+// Альтернатива/дополнение к затемнению: вместо (или вместе с) притушенных
+// соседей — акцент на самом активном окне, светящаяся обводка ровно по его
+// границе. Чужие окна при этом вообще не трогаются, только своё окно поверх
+// всех рисуем.
+final class BorderShadeView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let inset: CGFloat = 3
+        let path = NSBezierPath(
+            roundedRect: bounds.insetBy(dx: inset, dy: inset), xRadius: 10, yRadius: 10)
+        path.lineWidth = 4
+        NSColor.systemBlue.setStroke()
+        ctx.setShadow(
+            offset: .zero, blur: 8, color: NSColor.systemBlue.withAlphaComponent(0.7).cgColor)
+        path.stroke()
+    }
+}
+
+final class BorderOverlay: NSWindow {
+    private let borderView = BorderShadeView()
+
+    init() {
+        super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        ignoresMouseEvents = true
+        collectionBehavior = [
+            .canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary,
+        ]
+        contentView = borderView
+    }
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    func show(around frame: NSRect) {
+        borderView.frame = NSRect(origin: .zero, size: frame.size)
+        setFrame(frame, display: true)
+        orderFrontRegardless()
+    }
+
+    func hide() {
+        guard isVisible else { return }
+        orderOut(nil)
+    }
+}
+
 final class Controller: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
 
@@ -172,6 +240,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var dimValueLabel: NSTextField?
     private var glassTintLevel = 0
     private var glassTintValueLabel: NSTextField?
+    private var borderEnabled = false
+    private var borderOverlay: BorderOverlay?
+    private var lastBorderFrame: NSRect?
     // Значение NSGlassTintAmount в NSGlobalDomain, каким оно было ДО того,
     // как WinCycle его тронул, — чтобы вернуть на выходе. savedGlobalGlassTint
     // == nil среди прочего значит «ключа не было вовсе», тогда на выходе его
@@ -214,9 +285,12 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         let defaults = UserDefaults.standard
-        defaults.register(defaults: [Key.dimLevel: 35, Key.glassTintLevel: 0])
+        defaults.register(defaults: [
+            Key.dimLevel: 35, Key.glassTintLevel: 0, Key.borderEnabled: false,
+        ])
         dimLevel = defaults.integer(forKey: Key.dimLevel)
         glassTintLevel = defaults.integer(forKey: Key.glassTintLevel)
+        borderEnabled = defaults.bool(forKey: Key.borderEnabled)
 
         log("запуск")
         buildStatusItem()
@@ -276,11 +350,12 @@ final class Controller: NSObject, NSApplicationDelegate {
         lastFront = 0
     }
 
-    // Обычные окна на экране, спереди назад, как их отдаёт системный список.
-    // Мелкие всплывающие панельки, окна нерегулярных программ (значки в
-    // строке меню и подобные, включая наши собственные подложки) и окна
-    // программ, спрятанных через Command+H, в список не попадают.
-    private func realWindowIDs() -> [CGWindowID] {
+    // Обычные окна на экране, спереди назад, как их отдаёт системный список,
+    // вместе с их рамкой (нужна рамке подсветки активного окна). Мелкие
+    // всплывающие панельки, окна нерегулярных программ (значки в строке
+    // меню и подобные, включая наши собственные подложки) и окна программ,
+    // спрятанных через Command+H, в список не попадают.
+    private func realWindows() -> [(id: CGWindowID, bounds: CGRect)] {
         let mine = Set(overlays.map { CGWindowID($0.windowNumber) })
         guard
             let list = CGWindowListCopyWindowInfo(
@@ -288,7 +363,7 @@ final class Controller: NSObject, NSApplicationDelegate {
                 as? [[String: Any]]
         else { return [] }
 
-        var result: [CGWindowID] = []
+        var result: [(id: CGWindowID, bounds: CGRect)] = []
         for info in list {
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
                 let number = info[kCGWindowNumber as String] as? CGWindowID,
@@ -297,11 +372,14 @@ final class Controller: NSObject, NSApplicationDelegate {
             if let alpha = info[kCGWindowAlpha as String] as? Double, alpha < 0.01 {
                 continue
             }
-            // мелочь вроде всплывающих панелек не считаем отдельным окном
-            if let bounds = info[kCGWindowBounds as String] as? [String: CGFloat] {
-                let width = bounds["Width"] ?? 0, height = bounds["Height"] ?? 0
-                if width < 100 || height < 100 { continue }
+            guard let rawBounds = info[kCGWindowBounds as String] as? [String: CGFloat] else {
+                continue
             }
+            let bounds = CGRect(
+                x: rawBounds["X"] ?? 0, y: rawBounds["Y"] ?? 0,
+                width: rawBounds["Width"] ?? 0, height: rawBounds["Height"] ?? 0)
+            // мелочь вроде всплывающих панелек не считаем отдельным окном
+            if bounds.width < 100 || bounds.height < 100 { continue }
             if let pid = info[kCGWindowOwnerPID as String] as? pid_t,
                 let owner = NSRunningApplication(processIdentifier: pid)
             {
@@ -311,32 +389,42 @@ final class Controller: NSObject, NSApplicationDelegate {
                     continue
                 }
             }
-            result.append(number)
+            result.append((number, bounds))
         }
         return result
     }
 
     private func updateDimming(force: Bool) {
-        guard dimLevel > 0 || glassTintLevel > 0 else {
+        guard dimLevel > 0 || glassTintLevel > 0 || borderEnabled else {
             hideOverlays()
+            hideBorder()
             return
         }
-        let windows = realWindowIDs()
-        guard let front = windows.first else {
+        let windows = realWindows()
+        guard let frontWindow = windows.first else {
             hideOverlays()
+            hideBorder()
             return
         }
-        // Затемнять относительно чего? Если реальное окно на экране всего
-        // одно — сравнивать не с чем, и подложка только мешала бы тёмной
-        // полосой по краям.
+        // Затемнять/подсвечивать относительно чего? Если реальное окно на
+        // экране всего одно — сравнивать не с чем, и подложка (как и рамка)
+        // только мешала бы.
         guard windows.count > 1 else {
             hideOverlays()
+            hideBorder()
             return
         }
+        let front = frontWindow.id
         let alpha = CGFloat(dimLevel) / 100
         for overlay in overlays {
             overlay.apply(alpha: alpha)
             overlay.setGlass(enabled: glassTintLevel > 0)
+        }
+
+        if borderEnabled {
+            showBorder(around: frontWindow.bounds)
+        } else {
+            hideBorder()
         }
 
         // Порядок окон трогаем только когда активное сменилось: постоянная
@@ -349,6 +437,34 @@ final class Controller: NSObject, NSApplicationDelegate {
             overlay.orderFront(nil)
             overlay.order(.below, relativeTo: Int(front))
         }
+    }
+
+    // MARK: рамка вокруг активного окна
+
+    // Рамка ставится по фактической рамке окна из системного списка —
+    // тем же координатам, что уже отфильтрованы в realWindows(). CGWindowList
+    // отдаёt их в системе координат «сверху слева, без переворота»; NSWindow
+    // ждёт кокоавские (снизу слева), поэтому переворачиваем по высоте
+    // главного экрана — тот же приём, что раньше использовался для фуллскрина.
+    private func showBorder(around bounds: CGRect) {
+        let overlay = borderOverlay ?? BorderOverlay()
+        if borderOverlay == nil { borderOverlay = overlay }
+
+        let flipBase = NSScreen.screens.first?.frame.maxY ?? 0
+        let cocoaFrame = CGRect(
+            x: bounds.minX, y: flipBase - bounds.minY - bounds.height,
+            width: bounds.width, height: bounds.height)
+        guard cocoaFrame != lastBorderFrame else {
+            if !overlay.isVisible { overlay.orderFrontRegardless() }
+            return
+        }
+        lastBorderFrame = cocoaFrame
+        overlay.show(around: cocoaFrame)
+    }
+
+    private func hideBorder() {
+        lastBorderFrame = nil
+        borderOverlay?.hide()
     }
 
     // Журнал нужен для разбора полётов: снаружи не видно, дошло ли
@@ -402,6 +518,13 @@ final class Controller: NSObject, NSApplicationDelegate {
             glassSliderItem.view = makeGlassSliderView()
             menu.addItem(glassSliderItem)
         }
+
+        let borderItem = NSMenuItem(
+            title: "Рамка вокруг активного окна", action: #selector(toggleBorder),
+            keyEquivalent: "")
+        borderItem.target = self
+        borderItem.state = borderEnabled ? .on : .off
+        menu.addItem(borderItem)
 
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: "q")
@@ -545,8 +668,16 @@ final class Controller: NSObject, NSApplicationDelegate {
         updateDimming(force: true)
     }
 
+    @objc private func toggleBorder() {
+        borderEnabled.toggle()
+        UserDefaults.standard.set(borderEnabled, forKey: Key.borderEnabled)
+        rebuildMenu()
+        updateDimming(force: true)
+    }
+
     @objc private func quit() {
         hideOverlays()
+        hideBorder()
         NSApp.terminate(nil)
     }
 }
