@@ -15,69 +15,10 @@
 
 import AppKit
 
-// Отдельного вкл/выкл нет ни у затемнения, ни у стекла — ползунок на 0%
-// уже и есть «выключено», третье состояние было бы лишним.
+// Отдельного вкл/выкл нет — ползунок на 0% уже и есть «выключено», третье
+// состояние было бы лишним.
 private enum Key {
     static let dimLevel = "wincycle.dimLevel"
-    static let glassTintLevel = "wincycle.glassTintLevel"
-    // Настоящее значение NSGlassTintAmount до того, как WinCycle его вообще
-    // тронул, — хранится на диске (не только в памяти Controller), потому
-    // что ползунок теперь перезапускает процесс (см. relaunchSelf()): без
-    // этого следующий процесс в цепочке перезапусков принял бы уже
-    // записанное WinCycle значение за «оригинал» и в итоге не восстановил
-    // бы настоящее системное при выключении.
-    static let hasSavedSystemGlassTint = "wincycle.hasSavedSystemGlassTint"
-    static let savedSystemGlassTint = "wincycle.savedSystemGlassTint"
-    // У рамки, в отличие от затемнения и стекла, нет «силы» — только вкл/выкл.
-    static let borderEnabled = "wincycle.borderEnabled"
-}
-
-// Системный ключ за ползунком «Liquid Glass» в Системные настройки → Оформ-
-// ление (найден через `defaults read -g`, не документирован Apple). Это
-// ГЛОБАЛЬНАЯ настройка на весь стакан Liquid Glass в системе, а не свойство
-// одного окна: у самого NSGlassEffectView нет параметра силы размытия (см.
-// DESIGN.md), поэтому единственный способ её регулировать — через этот
-// ключ в NSGlobalDomain, а значит правка отражается на Safari, Finder,
-// Системных настройках и так далее, пока WinCycle его не вернёт обратно.
-//
-// Читаем и пишем через сам /usr/bin/defaults, а не через CFPreferences
-// напрямую: на этой версии системы CFPreferencesSetValue/CFPreferencesCopy-
-// Value с kCFPreferencesAnyApplication (и явным "NSGlobalDomain") молча
-// уходят в другое хранилище, не то же самое, что читает `defaults -g` и
-// сама System Settings, — проверено эмпирически: запись через CFPreferences
-// не отражалась во внешнем `defaults read -g`, а `defaults write -g` из
-// шелла отражалась всегда. Раз единственный публично подтверждённый рабочий
-// путь — сам CLI-инструмент, используем его, а не гадаем дальше про приватную
-// прослойку cfprefsd.
-private func readGlobalGlassTint() -> Double? {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-    task.arguments = ["read", "-g", "NSGlassTintAmount"]
-    let out = Pipe()
-    task.standardOutput = out
-    task.standardError = Pipe()
-    guard (try? task.run()) != nil else { return nil }
-    task.waitUntilExit()
-    guard task.terminationStatus == 0 else { return nil }
-    let data = out.fileHandleForReading.readDataToEndOfFile()
-    guard let text = String(data: data, encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    else { return nil }
-    return Double(text)
-}
-
-private func writeGlobalGlassTint(_ value: Double?) {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-    if let value {
-        task.arguments = ["write", "-g", "NSGlassTintAmount", "-float", String(value)]
-    } else {
-        task.arguments = ["delete", "-g", "NSGlassTintAmount"]
-    }
-    task.standardOutput = Pipe()
-    task.standardError = Pipe()
-    guard (try? task.run()) != nil else { return }
-    task.waitUntilExit()
 }
 
 // Приложения, чьи окна не должны учитываться при затемнении, даже когда
@@ -105,20 +46,6 @@ final class ShadeView: NSView {
 
 final class Overlay: NSWindow {
     let shade = ShadeView()
-    // NSGlassEffectView существует только с macOS 26 — заведён как обычный
-    // NSView?, чтобы не тащить условную компиляцию через весь файл.
-    //
-    // NSGlassEffectView читает глобальный NSGlassTintAmount (см. объявление
-    // ключа у Controller) ровно один раз за весь процесс — не за окно, не
-    // за конкретный экземпляр вью. Ни переписывание значения на месте, ни
-    // пересоздание того же вью, ни даже создание совсем нового окна внутри
-    // ТОГО ЖЕ процесса ничего не меняют — проверено попарным сравнением
-    // скриншотов (пиксель в пиксель одинаковые при 2% и 91%, edge-энергия
-    // совпадает с точностью до шума). Меняется только между разными
-    // ПРОЦЕССАМИ. Поэтому единственный работающий способ дать пользователю
-    // живой ползунок — перезапускать сам процесс WinCycle при отпускании
-    // ползунка (Controller.relaunchSelf()), а не подстраивать это окно.
-    private var glass: NSView?
 
     init(screen: NSScreen) {
         super.init(
@@ -133,23 +60,10 @@ final class Overlay: NSWindow {
             .canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary,
         ]
 
-        let container = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
-        container.autoresizingMask = [.width, .height]
-
-        if #available(macOS 26.0, *) {
-            let glassView = NSGlassEffectView(frame: container.bounds)
-            glassView.autoresizingMask = [.width, .height]
-            glassView.tintColor = .clear
-            glassView.isHidden = true
-            container.addSubview(glassView)
-            glass = glassView
-        }
-
-        shade.frame = container.bounds
+        shade.frame = NSRect(origin: .zero, size: screen.frame.size)
         shade.autoresizingMask = [.width, .height]
-        container.addSubview(shade)
+        contentView = shade
 
-        contentView = container
         setFrame(screen.frame, display: false)
     }
 
@@ -161,63 +75,6 @@ final class Overlay: NSWindow {
         shade.dimAlpha = alpha
         shade.needsDisplay = true
     }
-
-    // Проверка на «уже так и есть» не для красоты: это дёргается на каждом
-    // такте опроса, двадцать раз в секунду.
-    func setGlass(enabled: Bool) {
-        guard let glass, glass.isHidden == enabled else { return }
-        glass.isHidden = !enabled
-    }
-}
-
-// MARK: - Рамка вокруг активного окна
-
-// Альтернатива/дополнение к затемнению: вместо (или вместе с) притушенных
-// соседей — акцент на самом активном окне, светящаяся обводка ровно по его
-// границе. Чужие окна при этом вообще не трогаются, только своё окно поверх
-// всех рисуем.
-final class BorderShadeView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let inset: CGFloat = 3
-        let path = NSBezierPath(
-            roundedRect: bounds.insetBy(dx: inset, dy: inset), xRadius: 10, yRadius: 10)
-        path.lineWidth = 4
-        NSColor.systemBlue.setStroke()
-        ctx.setShadow(
-            offset: .zero, blur: 8, color: NSColor.systemBlue.withAlphaComponent(0.7).cgColor)
-        path.stroke()
-    }
-}
-
-final class BorderOverlay: NSWindow {
-    private let borderView = BorderShadeView()
-
-    init() {
-        super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
-        isOpaque = false
-        backgroundColor = .clear
-        hasShadow = false
-        ignoresMouseEvents = true
-        collectionBehavior = [
-            .canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary,
-        ]
-        contentView = borderView
-    }
-
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
-
-    func show(around frame: NSRect) {
-        borderView.frame = NSRect(origin: .zero, size: frame.size)
-        setFrame(frame, display: true)
-        orderFrontRegardless()
-    }
-
-    func hide() {
-        guard isVisible else { return }
-        orderOut(nil)
-    }
 }
 
 final class Controller: NSObject, NSApplicationDelegate {
@@ -228,23 +85,6 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var lastFront: CGWindowID = 0
     private var dimLevel = 35
     private var dimValueLabel: NSTextField?
-    private var glassTintLevel = 0
-    private var glassTintValueLabel: NSTextField?
-    private var borderEnabled = false
-    private var borderOverlay: BorderOverlay?
-    private var lastBorderFrame: NSRect?
-    // Значение NSGlassTintAmount в NSGlobalDomain, каким оно было ДО того,
-    // как WinCycle его тронул, — чтобы вернуть на выходе. savedGlobalGlassTint
-    // == nil среди прочего значит «ключа не было вовсе», тогда на выходе его
-    // нужно не записать, а убрать; glassTintSaved отличает это от «ещё не
-    // сохраняли».
-    private var glassTintSaved = false
-    private var savedGlobalGlassTint: Double?
-    // true между вызовом relaunchSelf() и фактическим завершением процесса —
-    // отличает намеренный самоперезапуск от настоящего выхода в
-    // applicationWillTerminate(): при самоперезапуске откатывать
-    // NSGlassTintAmount нельзя, иначе новый процесс увидит старое значение.
-    private var isRelaunching = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -253,21 +93,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         // переставляли бы подложки на каждом такте. Такое случается, когда
         // приложение поднимают и вручную, и службой автозапуска.
         let me = ProcessInfo.processInfo.processIdentifier
-        let bundleID = Bundle.main.bundleIdentifier ?? "local.wincycle"
-        func otherCopies() -> [NSRunningApplication] {
-            NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-                .filter { $0.processIdentifier != me }
-        }
-        var twins = otherCopies()
-        // Самоперезапуск (см. relaunchSelf()) на секунду-другую даёт увидеть
-        // ещё живую предыдущую копию, пока та завершается, — не считать
-        // это дублем сразу, а подождать немного, прежде чем сдаваться.
-        var attempts = 0
-        while !twins.isEmpty, attempts < 20 {
-            Thread.sleep(forTimeInterval: 0.1)
-            twins = otherCopies()
-            attempts += 1
-        }
+        let twins = NSRunningApplication.runningApplications(
+            withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.wincycle"
+        ).filter { $0.processIdentifier != me }
         if !twins.isEmpty {
             log("уже запущена другая копия — выхожу")
             NSApp.terminate(nil)
@@ -275,28 +103,12 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         let defaults = UserDefaults.standard
-        defaults.register(defaults: [
-            Key.dimLevel: 35, Key.glassTintLevel: 0, Key.borderEnabled: false,
-        ])
+        defaults.register(defaults: [Key.dimLevel: 35])
         dimLevel = defaults.integer(forKey: Key.dimLevel)
-        glassTintLevel = defaults.integer(forKey: Key.glassTintLevel)
-        borderEnabled = defaults.bool(forKey: Key.borderEnabled)
 
         log("запуск")
         buildStatusItem()
         startDimming()
-        if glassTintLevel > 0 { applyGlobalGlassTint() }
-    }
-
-    func applicationWillTerminate(_ note: Notification) {
-        // При самоперезапуске (isRelaunching) откатывать нечего — наоборот,
-        // именно это новое значение должен увидеть свежий процесс.
-        guard !isRelaunching else { return }
-        // Подстраховка на случай выхода не через наш пункт «Выход» (Cmd+Q,
-        // принудительное завершение через Activity Monitor и так далее) —
-        // без этого глобальный NSGlassTintAmount остался бы гулять по всей
-        // системе и после закрытия WinCycle.
-        if glassTintSaved { restoreGlobalGlassTint() }
     }
 
     // MARK: затемнение
@@ -372,12 +184,11 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     // Обычные окна на экране, спереди назад, как их отдаёт системный список,
-    // вместе с их рамкой (нужна рамке подсветки активного окна) и pid
-    // программы-владельца (нужен, чтобы после переключения дождаться, когда
-    // система реально поднимет окно новой программы). Мелкие всплывающие
-    // панельки, окна нерегулярных программ (значки в строке меню и подобные,
-    // включая наши собственные подложки) и окна программ, спрятанных через
-    // Command+H, в список не попадают.
+    // вместе с pid программы-владельца (нужен, чтобы после переключения
+    // дождаться, когда система реально поднимет окно новой программы).
+    // Мелкие всплывающие панельки, окна нерегулярных программ (значки в
+    // строке меню и подобные, включая наши собственные подложки) и окна
+    // программ, спрятанных через Command+H, в список не попадают.
     //
     // Дальше двух подходящих окон список не строим: наружу нужно только
     // самое переднее окно и признак «оно тут не одно». Опрос идёт двадцать
@@ -388,14 +199,14 @@ final class Controller: NSObject, NSApplicationDelegate {
     // приводим к [[String: Any]]: приведение переводит в свифтовые типы
     // ВЕСЬ массив разом, включая окна, до которых мы не дойдём. Ленивый
     // разбор поэлементно дешевле втрое (замерено).
-    private func realWindows() -> [(id: CGWindowID, bounds: CGRect, owner: pid_t)] {
+    private func realWindows() -> [(id: CGWindowID, owner: pid_t)] {
         let mine = Set(overlays.map { CGWindowID($0.windowNumber) })
         guard
             let list = CGWindowListCopyWindowInfo(
                 [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as NSArray?
         else { return [] }
 
-        var result: [(id: CGWindowID, bounds: CGRect, owner: pid_t)] = []
+        var result: [(id: CGWindowID, owner: pid_t)] = []
         for entry in list {
             guard let info = entry as? NSDictionary else { continue }
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
@@ -405,16 +216,12 @@ final class Controller: NSObject, NSApplicationDelegate {
             if let alpha = info[kCGWindowAlpha as String] as? Double, alpha < 0.01 {
                 continue
             }
-            guard let rawBounds = info[kCGWindowBounds as String] as? NSDictionary else {
-                continue
-            }
-            let bounds = CGRect(
-                x: (rawBounds["X"] as? NSNumber)?.doubleValue ?? 0,
-                y: (rawBounds["Y"] as? NSNumber)?.doubleValue ?? 0,
-                width: (rawBounds["Width"] as? NSNumber)?.doubleValue ?? 0,
-                height: (rawBounds["Height"] as? NSNumber)?.doubleValue ?? 0)
             // мелочь вроде всплывающих панелек не считаем отдельным окном
-            if bounds.width < 100 || bounds.height < 100 { continue }
+            if let bounds = info[kCGWindowBounds as String] as? NSDictionary {
+                let width = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
+                let height = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
+                if width < 100 || height < 100 { continue }
+            }
             let pid = info[kCGWindowOwnerPID as String] as? pid_t ?? 0
             if pid != 0, let owner = NSRunningApplication(processIdentifier: pid) {
                 if owner.activationPolicy != .regular { continue }
@@ -423,44 +230,31 @@ final class Controller: NSObject, NSApplicationDelegate {
                     continue
                 }
             }
-            result.append((number, bounds, pid))
+            result.append((number, pid))
             if result.count >= 2 { break }
         }
         return result
     }
 
     private func updateDimming(force: Bool) {
-        guard dimLevel > 0 || glassTintLevel > 0 || borderEnabled else {
+        guard dimLevel > 0 else {
             hideOverlays()
-            hideBorder()
             return
         }
         let windows = realWindows()
-        guard let frontWindow = windows.first else {
+        guard let front = windows.first?.id else {
             hideOverlays()
-            hideBorder()
             return
         }
-        // Затемнять/подсвечивать относительно чего? Если реальное окно на
-        // экране всего одно — сравнивать не с чем, и подложка (как и рамка)
-        // только мешала бы.
+        // Затемнять относительно чего? Если реальное окно на экране всего
+        // одно — сравнивать не с чем, и подложка только мешала бы тёмной
+        // полосой по краям.
         guard windows.count > 1 else {
             hideOverlays()
-            hideBorder()
             return
         }
-        let front = frontWindow.id
         let alpha = CGFloat(dimLevel) / 100
-        for overlay in overlays {
-            overlay.apply(alpha: alpha)
-            overlay.setGlass(enabled: glassTintLevel > 0)
-        }
-
-        if borderEnabled {
-            showBorder(around: frontWindow.bounds)
-        } else {
-            hideBorder()
-        }
+        for overlay in overlays { overlay.apply(alpha: alpha) }
 
         // Порядок окон трогаем только когда активное сменилось: постоянная
         // перестановка даёт мерцание.
@@ -475,34 +269,6 @@ final class Controller: NSObject, NSApplicationDelegate {
             overlay.orderFrontRegardless()
             overlay.order(.below, relativeTo: Int(front))
         }
-    }
-
-    // MARK: рамка вокруг активного окна
-
-    // Рамка ставится по фактической рамке окна из системного списка —
-    // тем же координатам, что уже отфильтрованы в realWindows(). CGWindowList
-    // отдаёt их в системе координат «сверху слева, без переворота»; NSWindow
-    // ждёт кокоавские (снизу слева), поэтому переворачиваем по высоте
-    // главного экрана — тот же приём, что раньше использовался для фуллскрина.
-    private func showBorder(around bounds: CGRect) {
-        let overlay = borderOverlay ?? BorderOverlay()
-        if borderOverlay == nil { borderOverlay = overlay }
-
-        let flipBase = NSScreen.screens.first?.frame.maxY ?? 0
-        let cocoaFrame = CGRect(
-            x: bounds.minX, y: flipBase - bounds.minY - bounds.height,
-            width: bounds.width, height: bounds.height)
-        guard cocoaFrame != lastBorderFrame else {
-            if !overlay.isVisible { overlay.orderFrontRegardless() }
-            return
-        }
-        lastBorderFrame = cocoaFrame
-        overlay.show(around: cocoaFrame)
-    }
-
-    private func hideBorder() {
-        lastBorderFrame = nil
-        borderOverlay?.hide()
     }
 
     // Журнал нужен для разбора полётов: снаружи не видно, дошло ли
@@ -530,7 +296,7 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     // MARK: строка меню
     //
-    // Раньше здесь был настоящий NSMenu с ползунками в кастомных NSView
+    // Раньше здесь был настоящий NSMenu с ползунком в кастомном NSView
     // внутри NSMenuItem — стандартный на вид приём, но с багом: у NSMenu
     // есть отдельная, недокументированная сессия отслеживания мыши для
     // вью внутри пункта меню, и после ПЕРВОГО полного перетаскивания
@@ -542,11 +308,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     //
     // NSPopover, в отличие от NSMenu, — обычное окно AppKit без этой особой
     // сессии отслеживания: обычные виджеты внутри него ведут себя как в
-    // любом другом окне, ползунки и чекбокс можно трогать сколько угодно
-    // раз подряд без переоткрытия.
+    // любом другом окне, ползунок можно двигать сколько угодно раз подряд.
 
     private let popover = NSPopover()
-    private var borderCheckbox: NSButton?
 
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -563,9 +327,8 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
 
         popover.behavior = .transient
-        let controller = NSViewController()
-        controller.view = makePopoverContentView()
-        popover.contentViewController = controller
+        popover.contentViewController = NSViewController()
+        popover.contentViewController?.view = makePopoverContentView()
     }
 
     @objc private func toggleStatusPopover(_ sender: NSStatusBarButton) {
@@ -577,7 +340,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     private func makePopoverContentView() -> NSView {
-        let width: CGFloat = 220
+        // Раскладка сверху вниз через накопительный y с явным зазором между
+        // блоками — фиксированные координаты впритык (без зазора) визуально
+        // читались как наложение подписи на ползунок и ползунка на кнопку.
         var y: CGFloat = 12
 
         let quit = NSButton(title: "Выход", target: self, action: #selector(quit))
@@ -585,154 +350,24 @@ final class Controller: NSObject, NSApplicationDelegate {
         quit.frame = NSRect(x: 18, y: y, width: 80, height: 20)
         y += 20 + 12
 
-        let border = NSButton(
-            checkboxWithTitle: "Рамка вокруг активного окна", target: self,
-            action: #selector(toggleBorder(_:)))
-        border.state = borderEnabled ? .on : .off
-        border.frame = NSRect(x: 18, y: y, width: 190, height: 18)
-        borderCheckbox = border
-        y += 18 + 10
-
-        var glassView: NSView?
-        if #available(macOS 26.0, *) {
-            let view = makeGlassSliderView()
-            view.frame.origin.y = y
-            glassView = view
-            y += 34 + 4
-        }
-
-        let dimView = makeDimSliderView()
-        dimView.frame.origin.y = y
-        y += 34 + 8
-
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: y))
-        container.addSubview(dimView)
-        if let glassView { container.addSubview(glassView) }
-        container.addSubview(border)
-        container.addSubview(quit)
-        return container
-    }
-
-    // MARK: NSGlassTintAmount (глобальный, см. объявление ключа выше)
-
-    private func applyGlobalGlassTint() {
-        if !glassTintSaved {
-            let defaults = UserDefaults.standard
-            if defaults.bool(forKey: Key.hasSavedSystemGlassTint) {
-                // Уже сохранён раньше — в том числе, возможно, ПРЕДЫДУЩИМ
-                // процессом в этой же цепочке самоперезапусков. Текущее
-                // значение NSGlassTintAmount сейчас — это уже значение,
-                // которое туда положил сам WinCycle, а не настоящий
-                // оригинал, так что читать его заново нельзя.
-                savedGlobalGlassTint = defaults.object(forKey: Key.savedSystemGlassTint) as? Double
-            } else {
-                savedGlobalGlassTint = readGlobalGlassTint()
-                defaults.set(true, forKey: Key.hasSavedSystemGlassTint)
-                if let value = savedGlobalGlassTint {
-                    defaults.set(value, forKey: Key.savedSystemGlassTint)
-                } else {
-                    defaults.removeObject(forKey: Key.savedSystemGlassTint)
-                }
-            }
-            glassTintSaved = true
-        }
-        writeGlobalGlassTint(Double(glassTintLevel) / 100)
-    }
-
-    private func restoreGlobalGlassTint() {
-        guard glassTintSaved else { return }
-        writeGlobalGlassTint(savedGlobalGlassTint)
-        glassTintSaved = false
-        let defaults = UserDefaults.standard
-        defaults.set(false, forKey: Key.hasSavedSystemGlassTint)
-        defaults.removeObject(forKey: Key.savedSystemGlassTint)
-    }
-
-    // NSGlassEffectView читает NSGlassTintAmount ровно один раз за весь
-    // процесс (см. комментарий у Overlay) — единственный способ показать
-    // новое значение живьём - перезапустить сам процесс WinCycle.
-    //
-    // Пробовали execv (замена образа текущего процесса на свежий, тот же
-    // PID) — технически перезапускает и подхватывает новое значение, но
-    // соединение со строкой меню это не переживает: значок WinCycle просто
-    // пропадает насовсем, потому что execv не даёт AppKit нормально закрыть
-    // старое соединение с оконным сервером перед тем, как его заменят.
-    // Вместо этого — честный новый процесс (`open -n`) и завершение
-    // старого через обычный NSApp.terminate(nil): так строка меню
-    // освобождается штатно, как при обычном выходе.
-    private func relaunchSelf() {
-        isRelaunching = true
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        task.arguments = ["-n", Bundle.main.bundlePath]
-        try? task.run()
-        NSApp.terminate(nil)
-    }
-
-    private func makeGlassSliderView() -> NSView {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 34))
-
-        let label = NSTextField(labelWithString: "Размытие стекла: \(glassTintLevel)%")
-        label.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
-        label.frame = NSRect(x: 18, y: 18, width: 190, height: 16)
-        container.addSubview(label)
-        glassTintValueLabel = label
-
-        let slider = NSSlider(frame: NSRect(x: 18, y: 2, width: 190, height: 18))
-        slider.minValue = 0
-        slider.maxValue = 100
-        slider.integerValue = glassTintLevel
-        slider.isContinuous = true
-        slider.target = self
-        slider.action = #selector(glassSliderChanged(_:))
-        container.addSubview(slider)
-
-        return container
-    }
-
-    @objc private func glassSliderChanged(_ sender: NSSlider) {
-        glassTintLevel = sender.integerValue
-        glassTintValueLabel?.stringValue = "Размытие стекла: \(glassTintLevel)%"
-        UserDefaults.standard.set(glassTintLevel, forKey: Key.glassTintLevel)
-
-        // Ключ глобальный (см. объявление выше) — переставать его трогать
-        // нужно ровно на переходе через 0, а не при каждом движении: 0%
-        // и есть «выключено», applyGlobalGlassTint() сама решает, сохранять
-        // ли оригинал заново (не сохранит второй раз, если уже включено).
-        if glassTintLevel > 0 {
-            applyGlobalGlassTint()
-        } else if glassTintSaved {
-            restoreGlobalGlassTint()
-        }
-        updateDimming(force: true)
-
-        // Само значение стекло подхватит только в новом процессе (см.
-        // relaunchSelf()) — перезапускаем не на каждый шаг перетаскивания
-        // (иначе за одно движение ползунка их были бы десятки), а один раз,
-        // когда мышь отпустили.
-        if NSApp.currentEvent?.type == .leftMouseUp {
-            relaunchSelf()
-        }
-    }
-
-    private func makeDimSliderView() -> NSView {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 34))
-
         let label = NSTextField(labelWithString: "Сила затемнения: \(dimLevel)%")
         label.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
-        label.frame = NSRect(x: 18, y: 18, width: 190, height: 16)
-        container.addSubview(label)
+        label.frame = NSRect(x: 18, y: y + 18, width: 184, height: 16)
         dimValueLabel = label
 
-        let slider = NSSlider(frame: NSRect(x: 18, y: 2, width: 190, height: 18))
+        let slider = NSSlider(frame: NSRect(x: 18, y: y, width: 184, height: 18))
         slider.minValue = 0
         slider.maxValue = 100
         slider.integerValue = dimLevel
         slider.isContinuous = true
         slider.target = self
         slider.action = #selector(sliderChanged(_:))
-        container.addSubview(slider)
+        y += 34 + 12
 
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: y))
+        container.addSubview(label)
+        container.addSubview(slider)
+        container.addSubview(quit)
         return container
     }
 
@@ -743,15 +378,8 @@ final class Controller: NSObject, NSApplicationDelegate {
         updateDimming(force: true)
     }
 
-    @objc private func toggleBorder(_ sender: NSButton) {
-        borderEnabled = sender.state == .on
-        UserDefaults.standard.set(borderEnabled, forKey: Key.borderEnabled)
-        updateDimming(force: true)
-    }
-
     @objc private func quit() {
         hideOverlays()
-        hideBorder()
         NSApp.terminate(nil)
     }
 }
