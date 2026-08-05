@@ -2,10 +2,10 @@
 # Сборка WinCycle.
 #
 # Подпись ставится постоянным самодельным сертификатом из отдельной связки
-# ключей, а не «на лету». Это принципиально: разрешение «Универсальный доступ»
-# macOS привязывает к отпечатку подписи, и при подписи на лету отпечаток
-# меняется от каждой правки кода — система считает приложение новым и требует
-# выдавать доступ заново. С постоянным сертификатом отпечаток не плавает.
+# ключей, а не «на лету» — так отпечаток подписи не меняется от пересборки
+# к пересборке (сейчас приложению это не критично: оно не запрашивает
+# никаких разрешений, но постоянный отпечаток всё равно избавляет Gatekeeper
+# от вопросов при каждом новом запуске).
 #
 # Связка: ~/Library/Keychains/wincycle.keychain-db (пароль wincycle)
 # Сертификат и ключ: ~/.local/src/wincycle/signing/
@@ -20,13 +20,12 @@ if [ ! -f "$KEYCHAIN" ]; then
     echo "Связки для подписи ещё нет. Сначала запустите ./setup-signing.sh"
     exit 1
 fi
-mkdir -p "$APP/Contents/MacOS"
-if [ ! -f "$APP/Contents/Info.plist" ]; then
-    cp "$(dirname "$0")/Info.plist" "$APP/Contents/Info.plist"
-fi
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Info.plist "$APP/Contents/Info.plist"
+cp WinCycle.icns "$APP/Contents/Resources/WinCycle.icns"
 
 echo "сборка…"
-swiftc -O main.swift -o WinCycle -framework AppKit -framework Carbon
+swiftc -O main.swift -o WinCycle -framework AppKit
 
 echo "остановка старой копии…"
 osascript -e 'tell application "WinCycle" to quit' 2>/dev/null || true

@@ -6,6 +6,7 @@
 	<key>CFBundleDisplayName</key>       <string>WinCycle</string>
 	<key>CFBundleIdentifier</key>        <string>local.wincycle</string>
 	<key>CFBundleExecutable</key>        <string>WinCycle</string>
+	<key>CFBundleIconFile</key>          <string>WinCycle</string>
 	<key>CFBundlePackageType</key>       <string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
 	<key>CFBundleShortVersionString</key><string>1.0</string>
